@@ -1,0 +1,31 @@
+[package]
+name = "caddy-archive-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Archive inspection and extraction command line"
+
+[[bin]]
+name = "arc"
+path = "src/main.rs"
+
+[features]
+default = []
+parallel = ["archive-core/parallel"]
+progress = ["dep:indicatif"]
+
+[dependencies]
+archive-core = { version = "0.1.0", package = "caddy-archive-core", path = "../archive-core", features = ["crypto", "wim", "sevenz", "udf", "bzip2", "brotli"] }
+archive-fs = { version = "0.1.0", package = "caddy-archive-fs", path = "../archive-fs" }
+ms-package = { version = "0.1.0", path = "../../../ms-package" }
+clap = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tempfile.workspace = true
+libc.workspace = true
+zeroize = "1"
+indicatif = { version = "0.18", optional = true }
+
+[lints]
+workspace = true

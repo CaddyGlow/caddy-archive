@@ -1,0 +1,62 @@
+name: Archive Bounded Fuzz
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 3 * * 1'
+permissions:
+  contents: read
+defaults:
+  run:
+    working-directory: archive-rs
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: archive-rs
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.CABINET_REPOSITORY || format('{0}/ms-cabinet', github.repository_owner) }}
+          ref: ${{ vars.CABINET_REF }}
+          path: cabinet
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.MKISO_RS_REPOSITORY || format('{0}/mkiso-rs', github.repository_owner) }}
+          ref: ${{ vars.MKISO_RS_REF }}
+          path: mkiso-rs
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.WIM_RS_REPOSITORY || format('{0}/wim-rs', github.repository_owner) }}
+          ref: ${{ vars.WIM_RS_REF }}
+          path: wim-rs
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.MS_COMPRESS_REPOSITORY || format('{0}/ms-compress', github.repository_owner) }}
+          ref: ${{ vars.MS_COMPRESS_REF }}
+          path: ms-compress
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.MS_PACKAGE_REPOSITORY || format('{0}/ms-package', github.repository_owner) }}
+          ref: ${{ vars.MS_PACKAGE_REF }}
+          path: ms-package
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fuzz
+          workspaces: |
+            archive-rs -> target
+            archive-rs/fuzz -> target
+      - run: sudo apt-get update && sudo apt-get install -y binutils-dev libunwind-dev liblzma-dev build-essential
+      - run: cargo install honggfuzz --version 0.5.62 --locked
+      - run: bash scripts/archive-fuzz-smoke.sh
+        env:
+          ARCHIVE_FUZZ_ITERATIONS: '10000'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: archive-fuzz-evidence
+          path: archive-rs/target/archive-fuzz
+          retention-days: 30

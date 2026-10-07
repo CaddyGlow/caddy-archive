@@ -1,0 +1,30 @@
+[package]
+name = "caddy-archive-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Browser WebAssembly bindings for caddy-archive"
+
+[lib]
+name = "archive_wasm"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+packages = ["dep:ms-package"]
+crypto = ["archive-core/crypto"]
+sevenz = ["archive-core/sevenz"]
+bzip2 = ["archive-core/bzip2"]
+brotli = ["archive-core/brotli"]
+
+[dependencies]
+archive-core = { version = "0.1.0", package = "caddy-archive-core", path = "../archive-core" }
+wasm-bindgen = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ms-package = { version = "0.1.0", path = "../../../ms-package", optional = true }
+
+[lints]
+workspace = true

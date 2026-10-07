@@ -1,0 +1,120 @@
+use std::{
+    io::Write,
+    process::{Command, Stdio},
+};
+
+#[test]
+fn tar_stdout_and_stdin_commands_round_trip() {
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("input");
+    std::fs::create_dir(&input).unwrap();
+    std::fs::write(input.join("file"), b"streamed").unwrap();
+    let create = Command::new(env!("CARGO_BIN_EXE_arc"))
+        .args(["create", "--format", "tar", "--input"])
+        .arg(&input)
+        .args(["--output", "-"])
+        .output()
+        .unwrap();
+    assert!(
+        create.status.success(),
+        "{}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    assert_eq!(create.stdout.len() % 512, 0);
+    for operation in ["list", "test", "extract"] {
+        let output = root.path().join("output");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_arc"));
+        command.args(["--json", operation, "-", "--format", "tar"]);
+        if operation == "extract" {
+            command.arg("--output").arg(&output);
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&create.stdout)
+            .unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(json["ok"], true);
+        if operation == "extract" {
+            assert_eq!(std::fs::read(output.join("file")).unwrap(), b"streamed");
+        }
+    }
+}
+
+#[test]
+fn json_argument_errors_remain_machine_readable() {
+    let result = Command::new(env!("CARGO_BIN_EXE_arc"))
+        .args(["--json", "extract"])
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(2));
+    let json: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(json["error"]["code"], 2);
+    assert!(result.stderr.is_empty());
+}
+
+#[test]
+fn inflate_and_deflate_forward_stdin_stdout_round_trip() {
+    for format in ["deflate", "gzip", "zlib"] {
+        let mut compressed = Vec::new();
+        for operation in ["deflate", "inflate"] {
+            let input = if operation == "deflate" {
+                b"forward codec payload".as_slice()
+            } else {
+                compressed.as_slice()
+            };
+            let mut child = Command::new(env!("CARGO_BIN_EXE_arc"))
+                .args([
+                    operation, "--format", format, "--input", "-", "--output", "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(input).unwrap();
+            let result = child.wait_with_output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            if operation == "deflate" {
+                compressed = result.stdout;
+            } else {
+                assert_eq!(result.stdout, b"forward codec payload");
+            }
+        }
+    }
+}
+
+#[test]
+fn failed_inflate_does_not_publish_file() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("broken.gz");
+    let output = root.path().join("output");
+    std::fs::write(&source, b"broken gzip").unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_arc"))
+        .args(["--json", "inflate", "--format", "gzip", "--input"])
+        .arg(source)
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(!output.exists());
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+}

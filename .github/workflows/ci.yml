@@ -1,0 +1,218 @@
+name: archive-rs CI
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**/*.md', 'docs/**']
+  pull_request:
+    paths-ignore: ['**/*.md', 'docs/**']
+  workflow_call:
+concurrency:
+  group: ${{ github.workflow }}-checks-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+permissions:
+  contents: read
+defaults:
+  run:
+    working-directory: archive-rs
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: archive-rs
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.CABINET_REPOSITORY || format('{0}/ms-cabinet', github.repository_owner) }}
+          ref: ${{ vars.CABINET_REF }}
+          path: cabinet
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.MKISO_RS_REPOSITORY || format('{0}/mkiso-rs', github.repository_owner) }}
+          ref: ${{ vars.MKISO_RS_REF }}
+          path: mkiso-rs
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.WIM_RS_REPOSITORY || format('{0}/wim-rs', github.repository_owner) }}
+          ref: ${{ vars.WIM_RS_REF }}
+          path: wim-rs
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.MS_COMPRESS_REPOSITORY || format('{0}/ms-compress', github.repository_owner) }}
+          ref: ${{ vars.MS_COMPRESS_REF }}
+          path: ms-compress
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.MS_PACKAGE_REPOSITORY || format('{0}/ms-package', github.repository_owner) }}
+          ref: ${{ vars.MS_PACKAGE_REF }}
+          path: ms-package
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: validation
+          workspaces: |
+            archive-rs -> target
+            archive-rs/fuzz -> target
+      - run: cargo fmt -p caddy-archive-core -p caddy-archive-fs -p caddy-archive-cli -p caddy-archive-wasm -- --check
+      - run: cargo test --workspace --all-features --locked
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --manifest-path fuzz/Cargo.toml --locked
+      - run: cargo fmt --manifest-path ../ms-package/Cargo.toml -- --check
+      - run: cargo test --manifest-path ../ms-package/Cargo.toml --all-features --locked
+      - run: cargo clippy --manifest-path ../ms-package/Cargo.toml --all-targets --all-features --locked -- -D warnings
+
+  archive-features:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: archive-rs
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.CABINET_REPOSITORY || format('{0}/ms-cabinet', github.repository_owner) }}
+          ref: ${{ vars.CABINET_REF }}
+          path: cabinet
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.MKISO_RS_REPOSITORY || format('{0}/mkiso-rs', github.repository_owner) }}
+          ref: ${{ vars.MKISO_RS_REF }}
+          path: mkiso-rs
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.WIM_RS_REPOSITORY || format('{0}/wim-rs', github.repository_owner) }}
+          ref: ${{ vars.WIM_RS_REF }}
+          path: wim-rs
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.MS_COMPRESS_REPOSITORY || format('{0}/ms-compress', github.repository_owner) }}
+          ref: ${{ vars.MS_COMPRESS_REF }}
+          path: ms-compress
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.MS_PACKAGE_REPOSITORY || format('{0}/ms-package', github.repository_owner) }}
+          ref: ${{ vars.MS_PACKAGE_REF }}
+          path: ms-package
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: validation
+          workspaces: |
+            archive-rs -> target
+            archive-rs/fuzz -> target
+      - name: Check independent archive CLI features
+        shell: bash
+        run: |
+          for ARCHIVE_FEATURES in none progress parallel both; do
+            args=(--no-default-features)
+            case "$ARCHIVE_FEATURES" in
+              progress|parallel) args+=(--features "$ARCHIVE_FEATURES") ;;
+              both) args+=(--features "progress,parallel") ;;
+            esac
+            cargo test -p caddy-archive-cli --locked "${args[@]}"
+            cargo clippy -p caddy-archive-cli --all-targets --locked "${args[@]}" -- -D warnings
+          done
+
+  archive-browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: archive-rs
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.CABINET_REPOSITORY || format('{0}/ms-cabinet', github.repository_owner) }}
+          ref: ${{ vars.CABINET_REF }}
+          path: cabinet
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.MKISO_RS_REPOSITORY || format('{0}/mkiso-rs', github.repository_owner) }}
+          ref: ${{ vars.MKISO_RS_REF }}
+          path: mkiso-rs
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.WIM_RS_REPOSITORY || format('{0}/wim-rs', github.repository_owner) }}
+          ref: ${{ vars.WIM_RS_REF }}
+          path: wim-rs
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.MS_COMPRESS_REPOSITORY || format('{0}/ms-compress', github.repository_owner) }}
+          ref: ${{ vars.MS_COMPRESS_REF }}
+          path: ms-compress
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.MS_PACKAGE_REPOSITORY || format('{0}/ms-package', github.repository_owner) }}
+          ref: ${{ vars.MS_PACKAGE_REF }}
+          path: ms-package
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: validation
+          workspaces: |
+            archive-rs -> target
+            archive-rs/fuzz -> target
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
+      - run: cargo build -p caddy-archive-wasm --features packages,crypto,sevenz,bzip2,brotli --target wasm32-unknown-unknown --locked
+      - name: Generate browser bindings and native parity fixtures
+        shell: bash
+        run: |
+          wasm-bindgen target/wasm32-unknown-unknown/debug/archive_wasm.wasm --target web --out-dir /tmp/archive-browser/pkg
+          cargo run --manifest-path ../ms-package/Cargo.toml --example browser_fixtures --locked -- /tmp/archive-browser/pkg/fixtures
+      - name: Run real browser Worker regression checks
+        shell: bash
+        env:
+          ARCHIVE_BROWSER: google-chrome
+        run: |
+          node scripts/archive-browser-server.mjs &
+          archive_server_pid=$!
+          trap 'kill "$archive_server_pid"' EXIT
+          node scripts/check-archive-browser.mjs
+
+  windows:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: archive-rs
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.CABINET_REPOSITORY || format('{0}/ms-cabinet', github.repository_owner) }}
+          ref: ${{ vars.CABINET_REF }}
+          path: cabinet
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.MKISO_RS_REPOSITORY || format('{0}/mkiso-rs', github.repository_owner) }}
+          ref: ${{ vars.MKISO_RS_REF }}
+          path: mkiso-rs
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.WIM_RS_REPOSITORY || format('{0}/wim-rs', github.repository_owner) }}
+          ref: ${{ vars.WIM_RS_REF }}
+          path: wim-rs
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.MS_COMPRESS_REPOSITORY || format('{0}/ms-compress', github.repository_owner) }}
+          ref: ${{ vars.MS_COMPRESS_REF }}
+          path: ms-compress
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.MS_PACKAGE_REPOSITORY || format('{0}/ms-package', github.repository_owner) }}
+          ref: ${{ vars.MS_PACKAGE_REF }}
+          path: ms-package
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: validation
+          workspaces: |
+            archive-rs -> target
+            archive-rs/fuzz -> target
+      - run: cargo test --workspace --all-features --locked

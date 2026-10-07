@@ -1,0 +1,23 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Archive WASM regression harness</title>
+<pre id="result">RUNNING</pre>
+<script type="module">
+const worker = new Worker('./worker.js', { type: 'module' });
+const result = document.querySelector('#result');
+worker.onmessage = ({data}) => {
+  result.textContent = JSON.stringify(data);
+  worker.terminate();
+};
+worker.onerror = (event) => {
+  result.textContent = JSON.stringify({ ok: false, error: event.message });
+  worker.terminate();
+};
+worker.postMessage({ command: 'test' });
+setTimeout(() => {
+  if (result.textContent === 'RUNNING') {
+    result.textContent = JSON.stringify({ ok: false, error: 'worker timeout' });
+    worker.terminate();
+  }
+}, 15000);
+</script>

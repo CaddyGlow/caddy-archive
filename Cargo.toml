@@ -11,7 +11,7 @@ license = "MIT"
 repository = "https://github.com/CaddyGlow/caddy-archive"
 
 [workspace.dependencies]
-libmkiso = { version = "0.1.0", path = "../mkiso-rs", default-features = false }
+libmkiso = { version = "0.1.0", default-features = false }
 anyhow = "1.0"
 clap = "4.5"
 serde_json = "1.0"

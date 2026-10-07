@@ -4,7 +4,7 @@ This Rust 2024 workspace owns archive-core, archive-fs, archive-cli (arc),
 and archive-wasm. The ms-package crate and patched MSI reader live in
 the sibling ms-package repository.
 Preserve crate names, licensing notices, test fixtures, and historical evidence.
-Keep the sibling cabinet, ms-compress, wim-rs and mkiso-rs checkouts available.
+Published dependencies resolve from crates.io.
 
 Use rustfmt defaults. Run `cargo test --workspace --all-features --locked`,
 `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`,

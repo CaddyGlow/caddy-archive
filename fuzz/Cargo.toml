@@ -9,10 +9,10 @@ publish = false
 
 [dependencies]
 honggfuzz = "0.5"
-cabinet = { version = "0.1.0", package = "ms-cabinet", path = "../../cabinet" }
+cabinet = { version = "0.1.0", package = "ms-cabinet" }
 archive-core = { version = "0.1.0", package = "caddy-archive-core", path = "../crates/archive-core", features = ["sevenz", "crypto", "wim", "udf", "bzip2", "brotli"] }
-ms-package = { version = "0.1.0", path = "../../ms-package" }
-libmkiso = { version = "0.1.0", path = "../../mkiso-rs", default-features = false, features = ["native-writer"] }
+ms-package = { version = "0.1.0" }
+libmkiso = { version = "0.1.0", default-features = false, features = ["native-writer"] }
 tempfile = "3"
 sha2 = "0.10"
 

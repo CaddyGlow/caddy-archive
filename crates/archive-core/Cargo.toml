@@ -30,11 +30,11 @@ crypto = ["dep:aes", "dep:ctr", "dep:pbkdf2", "dep:hmac", "dep:sha1", "dep:subtl
 [dependencies]
 bzip2 = { version = "0.6.1", optional = true }
 brotli = { version = "8", optional = true }
-ms-compress = { version = "0.1.0", path = "../../../ms-compress", default-features = false, features = ["std"] }
+ms-compress = { version = "0.1.0", default-features = false, features = ["std"] }
 crc64fast = { version = "1", optional = true }
 sha2 = { version = "0.10", optional = true }
 libmkiso = { workspace = true, optional = true, default-features = false }
-cabinet = { version = "0.1.0", package = "ms-cabinet", path = "../../../cabinet", optional = true }
+cabinet = { version = "0.1.0", package = "ms-cabinet", optional = true }
 zip = { version = "4", default-features = false, optional = true }
 tar = { version = "0.4", default-features = false, optional = true }
 serde = { version = "1", features = ["derive"] }
@@ -47,7 +47,7 @@ hmac = { version = "0.12", optional = true }
 sha1 = { version = "0.10", optional = true }
 subtle = { version = "2", optional = true }
 zeroize = { version = "1", optional = true }
-wim-format = { version = "0.1.0", path = "../../../wim-rs/crates/wim-format", default-features = false, features = ["std"], optional = true }
+wim-format = { version = "0.1.0", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

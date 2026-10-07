@@ -294,6 +294,16 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
+          python3 - <<'PYFLAT'
+          import pathlib, shutil
+          root = pathlib.Path('.')
+          for path in sorted(root.rglob('*')):
+              if path.is_file() and (path.name.endswith('.crate') or path.name.endswith('.tar.gz')) and path.parent != root:
+                  destination = root / path.name
+                  if destination.exists():
+                      raise SystemExit(f'Duplicate release asset: {path.name}')
+                  shutil.move(path, destination)
+          PYFLAT
           shopt -s nullglob
           files=(*.crate *.tar.gz)
           test "${#files[@]}" -gt 0

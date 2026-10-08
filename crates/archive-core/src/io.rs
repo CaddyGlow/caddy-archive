@@ -3,20 +3,12 @@ use crate::{Error, Result};
 use std::io::{self, Read, Seek, SeekFrom};
 
 /// Fallible retained-output allocation, checked before extending the buffer.
-#[cfg(any(
-    feature = "gzip",
-    feature = "xz",
-    all(feature = "streams", feature = "tar")
-))]
+#[cfg(any(feature = "gzip", feature = "xz", feature = "streams"))]
 pub(crate) struct BoundedBuffer {
     bytes: Vec<u8>,
     limit: u64,
 }
-#[cfg(any(
-    feature = "gzip",
-    feature = "xz",
-    all(feature = "streams", feature = "tar")
-))]
+#[cfg(any(feature = "gzip", feature = "xz", feature = "streams"))]
 impl BoundedBuffer {
     pub(crate) fn new(limit: u64) -> Self {
         Self {
@@ -28,11 +20,7 @@ impl BoundedBuffer {
         self.bytes
     }
 }
-#[cfg(any(
-    feature = "gzip",
-    feature = "xz",
-    all(feature = "streams", feature = "tar")
-))]
+#[cfg(any(feature = "gzip", feature = "xz", feature = "streams"))]
 impl io::Write for BoundedBuffer {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let end = self
@@ -138,6 +126,27 @@ impl<S: RangeSource> Seek for RangeReader<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(
+        feature = "gzip",
+        feature = "xz",
+        feature = "streams",
+        feature = "sevenz"
+    ))]
+    #[test]
+    fn bounded_buffer_grows_geometrically_for_short_writes() {
+        use std::io::Write;
+        let mut buffer = BoundedBuffer::new(4096);
+        let mut growths = 0;
+        for _ in 0..4096 {
+            let before = buffer.bytes.capacity();
+            buffer.write_all(&[42]).unwrap();
+            growths += usize::from(buffer.bytes.capacity() != before);
+        }
+        assert!(growths <= 13);
+        assert_eq!(buffer.bytes.len(), 4096);
+        assert!(buffer.write_all(&[42]).is_err());
+        assert_eq!(buffer.bytes.len(), 4096);
+    }
     #[test]
     fn range_reader_seek_and_read_are_bounded() {
         let mut reader = RangeReader::new(&b"abcdef"[..]).unwrap();

@@ -37,6 +37,29 @@ pub fn validate_name(name: &[u8]) -> io::Result<Vec<String>> {
     Ok(parts.into_iter().map(str::to_owned).collect())
 }
 
+/// A validated archive destination with cached components and collision key.
+#[derive(Clone, Debug)]
+pub struct ValidatedPath {
+    parts: Vec<String>,
+    key: String,
+}
+impl ValidatedPath {
+    /// Validate a portable destination name once before staging or publishing it.
+    pub fn new(name: &[u8]) -> io::Result<Self> {
+        let parts = validate_name(name)?;
+        let key = parts.join("/").to_lowercase();
+        Ok(Self { parts, key })
+    }
+    /// Case-insensitive key used to reject normalized destination collisions.
+    pub fn collision_key(&self) -> &str {
+        &self.key
+    }
+    /// Number of components, for restoring directory metadata from children upward.
+    pub fn depth(&self) -> usize {
+        self.parts.len()
+    }
+}
+
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
@@ -229,14 +252,22 @@ impl Destination {
         name: &[u8],
         metadata: &archive_core::EntryMetadata,
     ) -> io::Result<()> {
-        let parts = validate_name(name)?;
+        self.directory_metadata_validated(&ValidatedPath::new(name)?, metadata)
+    }
+    /// Restore metadata using previously validated directory components.
+    pub fn directory_metadata_validated(
+        &self,
+        path: &ValidatedPath,
+        metadata: &archive_core::EntryMetadata,
+    ) -> io::Result<()> {
+        let parts = &path.parts;
         #[cfg(unix)]
         {
-            apply_metadata(&self.parent(&parts)?, metadata)
+            apply_metadata(&self.parent(parts)?, metadata)
         }
         #[cfg(windows)]
         {
-            self.root.directory_metadata(&parts, metadata)
+            self.root.directory_metadata(parts, metadata)
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -265,7 +296,12 @@ impl Destination {
     /// Reserve an entry and open its operation-owned provisional output.
     /// Retain this object until the archive operation verifies the corresponding data.
     pub fn stage_file(&mut self, name: &[u8]) -> io::Result<StagedFile> {
-        let parts = self.reserve(name)?;
+        self.stage_validated_file(&ValidatedPath::new(name)?)
+    }
+    /// Stage a previously validated path without reparsing its name.
+    pub fn stage_validated_file(&mut self, name: &ValidatedPath) -> io::Result<StagedFile> {
+        self.reserve_validated(name)?;
+        let parts = &name.parts;
         let leaf = parts.last().ok_or_else(|| invalid("empty name"))?;
         #[cfg(unix)]
         {
@@ -339,25 +375,29 @@ impl Destination {
         }
     }
 
-    fn reserve(&mut self, name: &[u8]) -> io::Result<Vec<String>> {
-        let parts = validate_name(name)?;
-        let key = parts.join("/").to_lowercase();
-        if !self.names.insert(key) {
+    fn reserve_validated(&mut self, path: &ValidatedPath) -> io::Result<()> {
+        if !self.names.insert(path.key.clone()) {
             return Err(invalid("duplicate or normalized destination collision"));
         }
-        Ok(parts)
+        Ok(())
     }
 
     /// Create a directory entry. Links and special entries must be rejected by callers.
     pub fn directory(&mut self, name: &[u8]) -> io::Result<()> {
-        let parts = self.reserve(name)?;
+        self.directory_validated(&ValidatedPath::new(name)?)
+    }
+
+    /// Create a directory using previously validated components.
+    pub fn directory_validated(&mut self, path: &ValidatedPath) -> io::Result<()> {
+        self.reserve_validated(path)?;
+        let parts = &path.parts;
         #[cfg(unix)]
         {
-            self.parent(&parts).map(|_| ())
+            self.parent(parts).map(|_| ())
         }
         #[cfg(windows)]
         {
-            self.root.parent(&parts).map(|_| ())
+            self.root.parent(parts).map(|_| ())
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -387,7 +427,20 @@ impl Destination {
     where
         F: FnOnce(&mut std::fs::File) -> io::Result<u64>,
     {
-        let mut staged = self.stage_file(name)?;
+        self.file_with_validated_metadata(&ValidatedPath::new(name)?, metadata, verified_writer)
+    }
+
+    /// Publish a previously validated path with stored metadata.
+    pub fn file_with_validated_metadata<F>(
+        &mut self,
+        name: &ValidatedPath,
+        metadata: &archive_core::EntryMetadata,
+        verified_writer: F,
+    ) -> io::Result<u64>
+    where
+        F: FnOnce(&mut std::fs::File) -> io::Result<u64>,
+    {
+        let mut staged = self.stage_validated_file(name)?;
         let bytes = verified_writer(staged.file_mut())?;
         staged.publish_with_metadata(metadata)?;
         Ok(bytes)
@@ -738,6 +791,31 @@ mod tests {
         );
         assert!(!outside.path().join("file").exists());
     }
+    #[test]
+    fn cached_validated_paths_preserve_collision_checks() {
+        let root = tempfile::tempdir().unwrap();
+        let mut destination = Destination::open(root.path()).unwrap();
+        let path = ValidatedPath::new(b"Nested/File").unwrap();
+        assert_eq!(path.collision_key(), "nested/file");
+        destination
+            .file_with_validated_metadata(&path, &Default::default(), |file| {
+                file.write_all(b"payload")?;
+                Ok(7)
+            })
+            .unwrap();
+        assert!(
+            destination
+                .stage_validated_file(&ValidatedPath::new(b"nested/file").unwrap())
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("Nested/File")).unwrap(),
+            b"payload"
+        );
+        assert!(ValidatedPath::new(b"../escape").is_err());
+        assert!(ValidatedPath::new(b"NUL.txt").is_err());
+    }
+
     #[cfg(windows)]
     #[test]
     fn retained_root_and_staged_parent_cannot_be_renamed() {

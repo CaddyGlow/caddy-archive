@@ -9,10 +9,20 @@ targets=${ARCHIVE_FUZZ_TARGETS:-"archive package optical"}
 mkdir -p "$output/corpus/archive" "$output/corpus/package" "$output/corpus/optical" "$output/logs" "$output/workspace"
 cd "$root"
 cargo run --locked -p caddy-archive-core --features bzip2,brotli --example fuzz_seeds -- "$output/corpus"
-cargo run --manifest-path ../ms-package/Cargo.toml --locked --example browser_fixtures -- "$output/corpus/package"
+(cd crates/archive-wasm/tests/fixtures/package && sha256sum --check SHA256SUMS)
+find crates/archive-wasm/tests/fixtures/package -type f \( -name '*.msix' -o -name '*.msixbundle' -o -name '*.msi' -o -name '*.cab' \) -exec cp --backup=numbered '{}' "$output/corpus/package/" \;
 cargo run --manifest-path fuzz/Cargo.toml --locked --bin seed_iso -- "$output/corpus/optical"
-find crates/archive-core/tests/fixtures ../wim-rs/crates/wim-format/tests/fixtures -type f \( -name '*.7z' -o -name '*.wim' -o -name '*.esd' \) -size -1048577c -exec cp --backup=numbered '{}' "$output/corpus/archive/" \;
-find ../ms-package/tests/fixtures -type f -name '*.msi' -size -1048577c -exec cp --backup=numbered '{}' "$output/corpus/package/" \;
+find crates/archive-core/tests/fixtures -type f \( -name '*.7z' -o -name '*.wim' -o -name '*.esd' \) -size -1048577c -exec cp --backup=numbered '{}' "$output/corpus/archive/" \;
+# Extend the self-contained smoke corpus with optional local regression evidence.
+for extra in ../wim-rs/crates/wim-format/tests/fixtures ../ms-package/tests/fixtures; do
+    if [[ -d "$extra" ]]; then
+        if [[ "$extra" == *wim-format* ]]; then
+            find "$extra" -type f \( -name '*.wim' -o -name '*.esd' \) -size -1048577c -exec cp --backup=numbered '{}' "$output/corpus/archive/" \;
+        else
+            find "$extra" -type f -name '*.msi' -size -1048577c -exec cp --backup=numbered '{}' "$output/corpus/package/" \;
+        fi
+    fi
+done
 find "$output/corpus" -type f -exec sha256sum '{}' \; > "$output/seeds.sha256"
 cargo hfuzz version > "$output/tool-version.txt" 2>&1
 rustc -Vv >> "$output/tool-version.txt"

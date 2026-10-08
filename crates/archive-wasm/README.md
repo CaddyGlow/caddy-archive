@@ -38,7 +38,8 @@ cancellation. Generate bindings and package fixtures in temporary storage:
 ```sh
 cargo build -p caddy-archive-wasm --features packages,crypto,sevenz,bzip2,brotli --target wasm32-unknown-unknown --locked
 wasm-bindgen "$CARGO_TARGET_DIR/wasm32-unknown-unknown/debug/archive_wasm.wasm" --target web --out-dir /tmp/archive-browser/pkg
-cargo run --manifest-path ../ms-package/Cargo.toml --example browser_fixtures -- /tmp/archive-browser/pkg/fixtures
+mkdir -p /tmp/archive-browser/pkg/fixtures
+cp crates/archive-wasm/tests/fixtures/package/* /tmp/archive-browser/pkg/fixtures/
 node scripts/archive-browser-server.mjs
 node scripts/check-archive-browser.mjs
 ```

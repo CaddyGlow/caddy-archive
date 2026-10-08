@@ -3,8 +3,7 @@ use archive_core::{Limits, wim::WimArchive};
 
 #[test]
 fn selected_image_payload_matches_existing_independently_generated_fixture() {
-    let bytes =
-        include_bytes!("../../../../wim-rs/crates/wim-format/tests/fixtures/xpress-resource.wim");
+    let bytes = include_bytes!("fixtures/xpress-resource.wim");
     let archive = WimArchive::open(bytes, 1, Limits::default()).unwrap();
     assert_eq!(archive.image_count(), 1);
     let file = archive
@@ -22,8 +21,7 @@ fn selected_image_payload_matches_existing_independently_generated_fixture() {
 
 #[test]
 fn image_selector_and_metadata_budget_are_enforced() {
-    let bytes =
-        include_bytes!("../../../../wim-rs/crates/wim-format/tests/fixtures/xpress-resource.wim");
+    let bytes = include_bytes!("fixtures/xpress-resource.wim");
     assert!(WimArchive::open(bytes, 0, Limits::default()).is_err());
     assert!(WimArchive::open(bytes, 2, Limits::default()).is_err());
     let limits = Limits {
@@ -123,9 +121,7 @@ fn seekable_wim_does_not_read_whole_input_or_emit_whole_file() {
             Ok(())
         }
     }
-    let mut bytes =
-        include_bytes!("../../../../wim-rs/crates/wim-format/tests/fixtures/xpress-resource.wim")
-            .to_vec();
+    let mut bytes = include_bytes!("fixtures/xpress-resource.wim").to_vec();
     bytes.resize(4 << 20, 0);
     let count = Rc::new(Cell::new(0));
     let reader = Counted {

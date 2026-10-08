@@ -85,20 +85,9 @@ fn workspace(bytes: u64, limits: Limits) -> Result<()> {
     Ok(())
 }
 fn buffer(reader: &mut impl Read, maximum: u64) -> Result<Vec<u8>> {
-    let mut data = Vec::new();
-    let mut chunk = [0; 65536];
-    loop {
-        let count = reader.read(&mut chunk)?;
-        if count == 0 {
-            return Ok(data);
-        }
-        if data.len() as u64 + count as u64 > maximum {
-            return Err(Error::ResourceLimit("single-file input bytes"));
-        }
-        data.try_reserve_exact(count)
-            .map_err(|_| Error::ResourceLimit("single-file allocation"))?;
-        data.extend_from_slice(&chunk[..count]);
-    }
+    let mut data = crate::range::BoundedBuffer::new(maximum);
+    copy_bounded(reader, &mut data, maximum)?;
+    Ok(data.into_inner())
 }
 fn window(codec: Codec, options: Options, limits: Limits) -> Result<usize> {
     let range = if codec == Codec::Quantum {

@@ -998,6 +998,7 @@ fn build_coder<'a, R: Read + Seek>(
                     .map_err(|_| malformed("LZMA dictionary"))?,
             );
             check_memory(
+                u64::from(dict),
                 lzma::lzma_get_memory_usage_by_props(dict, props[0])? as u64 * 1024,
                 password.limits,
             )?;
@@ -1016,48 +1017,41 @@ fn build_coder<'a, R: Read + Seek>(
             if !props.is_empty() {
                 return Err(malformed("DEFLATE properties"));
             }
-            check_memory(
-                f.unpack_sizes[index]
-                    .checked_add(1 << 20)
-                    .ok_or(Error::ResourceLimit("DEFLATE workspace"))?,
-                password.limits,
-            )?;
-            let mut encoded = input;
-            let mut decoded = Vec::new();
-            let capacity = usize::try_from(f.unpack_sizes[index])
-                .map_err(|_| Error::ResourceLimit("DEFLATE unpacked size"))?;
-            decoded
-                .try_reserve_exact(capacity)
-                .map_err(|_| Error::ResourceLimit("DEFLATE workspace allocation"))?;
-            let bytes = crate::codec::inflate_window(
-                &mut encoded,
-                &mut decoded,
+            check_memory(32768, 1 << 20, password.limits)?;
+            Ok(Box::new(crate::codec::InflateReader::new(
+                input,
                 0,
                 f.unpack_sizes[index],
                 1,
-            )?;
-            if bytes != f.unpack_sizes[index] {
-                return Err(malformed("DEFLATE unpacked size"));
-            }
-            Ok(Box::new(io::Cursor::new(decoded)))
+            )))
         }
         LZMA2 => {
             let dict = lzma2_dictionary(props)?;
             check_memory(
+                u64::from(dict),
                 lzma::lzma2_get_memory_usage(dict) as u64 * 1024,
                 password.limits,
             )?;
             Ok(Box::new(Lzma2Reader::new(input, dict, None)))
         }
-        AES => decrypt_reader(input, props, password),
+        AES => Ok(Box::new(Verified {
+            inner: decrypt_reader(input, props, password)?,
+            remaining: f.unpack_sizes[index],
+            crc: 0,
+            expected: None,
+            checked: false,
+            // AES padding is outside the declared coder output and must not
+            // reach a subsequent Copy or strict compressed-stream decoder.
+            check_end: false,
+        })),
         #[cfg(feature = "bzip2")]
         BZIP2 => {
-            check_memory(16 * 1024 * 1024, password.limits)?;
+            check_memory(900_000, 16 * 1024 * 1024, password.limits)?;
             Ok(Box::new(bzip2::read::BzDecoder::new(input)))
         }
         #[cfg(feature = "brotli")]
         BROTLI => {
-            check_memory(BROTLI_WORKSPACE, password.limits)?;
+            check_memory(1 << 24, BROTLI_WORKSPACE, password.limits)?;
             Ok(Box::new(BrotliReader::new(input, password.limits)?))
         }
         [3] => {
@@ -1110,8 +1104,8 @@ pub(crate) fn lzma2_dictionary(props: &[u8]) -> Result<u32> {
         (2 | (p & 1)) << (p / 2 + 11)
     })
 }
-fn check_memory(bytes: u64, limits: Limits) -> Result<()> {
-    if bytes > limits.max_dictionary_bytes || bytes > limits.max_active_workspace_bytes {
+fn check_memory(dictionary: u64, bytes: u64, limits: Limits) -> Result<()> {
+    if dictionary > limits.max_dictionary_bytes || bytes > limits.max_active_workspace_bytes {
         Err(Error::ResourceLimit("7z codec workspace"))
     } else {
         Ok(())
@@ -1475,58 +1469,203 @@ fn write_streams(out: &mut Vec<u8>, folders: &[WrittenFolder], position: u64) {
 }
 
 #[cfg(feature = "crypto")]
-fn encrypt(data: &mut Vec<u8>, options: &mut CreateOptions<'_>) -> Result<Coder> {
-    use aes::cipher::{BlockEncryptMut, KeyIvInit};
-    let bytes = options.password.ok_or(Error::PasswordRequired)?;
-    let text = std::str::from_utf8(bytes)
-        .map_err(|_| Error::Unsupported("7z password must be UTF-8 text".into()))?;
-    let random = options
-        .randomness
-        .as_mut()
-        .ok_or_else(|| Error::Unsupported("7z encryption requires random provider".into()))?;
-    let mut props = vec![19 | 0xc0, 255];
-    let mut random_bytes = [0u8; 32];
-    random.fill(&mut random_bytes)?;
-    props.extend_from_slice(&random_bytes);
-    let password = Password::new(text);
-    let (mut key, iv) = aes_key(&props, &password)?;
-    let mut cipher = cbc::Encryptor::<aes::Aes256>::new((&key).into(), (&iv).into());
-    zeroize::Zeroize::zeroize(&mut key);
-    let padding = (16 - data.len() % 16) % 16;
-    data.resize(data.len() + padding, 0);
-    for chunk in data.chunks_exact_mut(16) {
-        let mut block = aes::cipher::Block::<aes::Aes256>::default();
-        block.copy_from_slice(chunk);
-        cipher.encrypt_block_mut(&mut block);
-        chunk.copy_from_slice(&block);
-    }
-    Ok(Coder {
-        method: AES.to_vec(),
-        props,
-        inputs: 1,
-    })
+struct EncryptWriter<W> {
+    output: W,
+    cipher: cbc::Encryptor<aes::Aes256>,
+    pending: [u8; 16],
+    used: usize,
 }
-#[cfg(not(feature = "crypto"))]
-fn encrypt(_: &mut Vec<u8>, _: &mut CreateOptions<'_>) -> Result<Coder> {
-    Err(Error::Unsupported("7z crypto feature unavailable".into()))
+#[cfg(feature = "crypto")]
+impl<W: Write> EncryptWriter<W> {
+    fn new(output: W, options: &mut CreateOptions<'_>, limits: Limits) -> Result<(Self, Coder)> {
+        use aes::cipher::KeyIvInit;
+        let text = std::str::from_utf8(options.password.ok_or(Error::PasswordRequired)?)
+            .map_err(|_| Error::Unsupported("7z password must be UTF-8 text".into()))?;
+        let random = options
+            .randomness
+            .as_mut()
+            .ok_or_else(|| Error::Unsupported("7z encryption requires random provider".into()))?;
+        let mut props = vec![19 | 0xc0, 255];
+        let mut random_bytes = [0; 32];
+        random.fill(&mut random_bytes)?;
+        props.extend_from_slice(&random_bytes);
+        let mut password = Password::new(text);
+        password.limits = limits;
+        let (mut key, iv) = aes_key(&props, &password)?;
+        let cipher = cbc::Encryptor::<aes::Aes256>::new((&key).into(), (&iv).into());
+        zeroize::Zeroize::zeroize(&mut key);
+        Ok((
+            Self {
+                output,
+                cipher,
+                pending: [0; 16],
+                used: 0,
+            },
+            Coder {
+                method: AES.to_vec(),
+                props,
+                inputs: 1,
+            },
+        ))
+    }
+    fn emit_block(&mut self) -> io::Result<()> {
+        use aes::cipher::BlockEncryptMut;
+        let mut block = aes::cipher::Block::<aes::Aes256>::default();
+        block.copy_from_slice(&self.pending);
+        self.cipher.encrypt_block_mut(&mut block);
+        self.output.write_all(&block)?;
+        self.pending.fill(0);
+        self.used = 0;
+        Ok(())
+    }
+    fn finish(mut self) -> Result<()> {
+        if self.used != 0 {
+            self.emit_block()?;
+        }
+        Ok(())
+    }
+}
+#[cfg(feature = "crypto")]
+impl<W: Write> Write for EncryptWriter<W> {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        use aes::cipher::BlockEncryptMut;
+        let mut remaining = input;
+        if self.used != 0 {
+            let n = remaining.len().min(16 - self.used);
+            self.pending[self.used..self.used + n].copy_from_slice(&remaining[..n]);
+            self.used += n;
+            remaining = &remaining[n..];
+            if self.used == 16 {
+                self.emit_block()?;
+            }
+        }
+        let mut encrypted = [0u8; 65536];
+        while remaining.len() >= 16 {
+            let n = remaining.len().min(encrypted.len()) / 16 * 16;
+            for (source, target) in remaining[..n]
+                .chunks_exact(16)
+                .zip(encrypted[..n].chunks_exact_mut(16))
+            {
+                let mut block = aes::cipher::Block::<aes::Aes256>::default();
+                block.copy_from_slice(source);
+                self.cipher.encrypt_block_mut(&mut block);
+                target.copy_from_slice(&block);
+            }
+            self.output.write_all(&encrypted[..n])?;
+            remaining = &remaining[n..];
+        }
+        if !remaining.is_empty() {
+            self.pending[..remaining.len()].copy_from_slice(remaining);
+            self.used = remaining.len();
+        }
+        Ok(input.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
+}
+struct OutputStats<W> {
+    output: W,
+    bytes: u64,
+    crc: u32,
+}
+impl<W> OutputStats<W> {
+    fn new(output: W) -> Self {
+        Self {
+            output,
+            bytes: 0,
+            crc: 0,
+        }
+    }
+}
+impl<W: Write> Write for OutputStats<W> {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        let n = self.output.write(input)?;
+        self.bytes = self
+            .bytes
+            .checked_add(n as u64)
+            .ok_or_else(|| io::Error::other("7z output size overflow"))?;
+        self.crc = crc32(self.crc, &input[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
+}
+struct InputStats<R> {
+    input: R,
+    bytes: u64,
+    crc: u32,
+}
+impl<R: Read> Read for InputStats<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let n = self.input.read(output)?;
+        self.bytes = self
+            .bytes
+            .checked_add(n as u64)
+            .ok_or_else(|| io::Error::other("7z input size overflow"))?;
+        self.crc = crc32(self.crc, &output[..n]);
+        Ok(n)
+    }
+}
+fn copy_payload(input: &mut impl Read, output: &mut impl Write) -> Result<()> {
+    let mut buffer = [0; 65536];
+    loop {
+        let n = input.read(&mut buffer)?;
+        if n == 0 {
+            return Ok(());
+        }
+        output.write_all(&buffer[..n])?;
+    }
 }
 
-fn encode_payload(data: &[u8], method: crate::SevenZipCompression) -> Result<(Vec<u8>, Coder)> {
+fn check_encoder(method: crate::SevenZipCompression, limits: Limits) -> Result<u64> {
     use crate::SevenZipCompression;
-    let (encoded, method, props) = match method {
-        SevenZipCompression::Copy => (data.to_vec(), COPY, Vec::new()),
+    let (dictionary, workspace) = match method {
+        SevenZipCompression::Copy => (0, 0),
+        SevenZipCompression::Deflate => (32768, 1 << 20),
+        SevenZipCompression::Lzma | SevenZipCompression::Lzma2 => {
+            let settings = lzma::LzmaOptions::with_preset(6);
+            (
+                u64::from(settings.dict_size),
+                u64::from(settings.get_memory_usage()) * 1024 + (1 << 20),
+            )
+        }
+        SevenZipCompression::Bzip2 => (900_000, 16 << 20),
+        SevenZipCompression::Brotli => (1 << 22, 96 << 20),
+    };
+    let workspace = workspace + 65536;
+    check_memory(dictionary, workspace, limits)?;
+    Ok(workspace)
+}
+
+fn encode_payload(
+    input: &mut impl Read,
+    output: &mut impl Write,
+    method: crate::SevenZipCompression,
+    limits: Limits,
+) -> Result<Coder> {
+    use crate::SevenZipCompression;
+    check_encoder(method, limits)?;
+    let (method, props) = match method {
+        SevenZipCompression::Copy => {
+            copy_payload(input, output)?;
+            (COPY, Vec::new())
+        }
         SevenZipCompression::Deflate => {
-            let mut encoded = Vec::new();
-            crate::codec::deflate(data, &mut encoded, false)?;
-            (encoded, DEFLATE, Vec::new())
+            let mut encoder = crate::codec::DeflateWriter::new(output, -15);
+            copy_payload(input, &mut encoder)?;
+            encoder.finish()?;
+            (DEFLATE, Vec::new())
         }
         SevenZipCompression::Lzma => {
             let settings = lzma::LzmaOptions::with_preset(6);
-            let mut encoder = lzma::LzmaWriter::new_no_header(Vec::new(), &settings, true)?;
+            let mut encoder = lzma::LzmaWriter::new_no_header(output, &settings, true)?;
             let mut props = vec![encoder.props()];
             props.extend_from_slice(&settings.dict_size.to_le_bytes());
-            encoder.write_all(data)?;
-            (encoder.finish()?, LZMA, props)
+            copy_payload(input, &mut encoder)?;
+            encoder.finish()?;
+            (LZMA, props)
         }
         SevenZipCompression::Lzma2 => {
             let settings = Lzma2Options::with_preset(6);
@@ -1534,17 +1673,18 @@ fn encode_payload(data: &[u8], method: crate::SevenZipCompression) -> Result<(Ve
             let prop = (0..=40)
                 .find(|p| lzma2_dictionary(&[*p]).is_ok_and(|d| d >= dict))
                 .ok_or_else(|| malformed("writer dictionary"))?;
-            let mut encoder = Lzma2Writer::new(Vec::new(), settings);
-            encoder.write_all(data)?;
-            (encoder.finish()?, LZMA2, vec![prop])
+            let mut encoder = Lzma2Writer::new(output, settings);
+            copy_payload(input, &mut encoder)?;
+            encoder.finish()?;
+            (LZMA2, vec![prop])
         }
         SevenZipCompression::Bzip2 => {
             #[cfg(feature = "bzip2")]
             {
-                let mut encoder =
-                    bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::new(9));
-                encoder.write_all(data)?;
-                (encoder.finish()?, BZIP2, Vec::new())
+                let mut encoder = bzip2::write::BzEncoder::new(output, bzip2::Compression::new(9));
+                copy_payload(input, &mut encoder)?;
+                encoder.finish()?;
+                (BZIP2, Vec::new())
             }
             #[cfg(not(feature = "bzip2"))]
             return Err(Error::Unsupported("BZip2 feature unavailable".into()));
@@ -1552,32 +1692,59 @@ fn encode_payload(data: &[u8], method: crate::SevenZipCompression) -> Result<(Ve
         SevenZipCompression::Brotli => {
             #[cfg(feature = "brotli")]
             {
-                let mut encoded = Vec::new();
-                {
-                    let mut encoder = brotli::CompressorWriter::new(&mut encoded, 8192, 5, 22);
-                    encoder.write_all(data)?;
-                }
-                (encoded, BROTLI, Vec::new())
+                let params = brotli::enc::BrotliEncoderParams {
+                    quality: 5,
+                    lgwin: 22,
+                    ..Default::default()
+                };
+                brotli::BrotliCompress(input, output, &params)?;
+                (BROTLI, Vec::new())
             }
             #[cfg(not(feature = "brotli"))]
             return Err(Error::Unsupported("Brotli feature unavailable".into()));
         }
     };
-    Ok((
-        encoded,
-        Coder {
-            method: method.to_vec(),
-            props,
-            inputs: 1,
-        },
-    ))
+    Ok(Coder {
+        method: method.to_vec(),
+        props,
+        inputs: 1,
+    })
 }
 
 pub(crate) fn write<W: Write + Seek>(
     entries: &[CreateEntry],
+    output: W,
+    options: &mut CreateOptions<'_>,
+    limits: Limits,
+) -> Result<()> {
+    write_readers(
+        entries,
+        &mut |index| Ok(Box::new(io::Cursor::new(entries[index].data.as_slice()))),
+        output,
+        options,
+        limits,
+    )
+}
+pub(crate) fn write_readers<'a, E: crate::CreationEntry, W: Write + Seek>(
+    entries: &[E],
+    open: &mut impl FnMut(usize) -> Result<Box<dyn Read + 'a>>,
     mut output: W,
     options: &mut CreateOptions<'_>,
+    limits: Limits,
 ) -> Result<()> {
+    let workspace = check_encoder(options.sevenz_compression, limits)?;
+    let _ = workspace;
+    if options.password.is_some() {
+        #[cfg(not(feature = "crypto"))]
+        return Err(Error::Unsupported("7z crypto feature unavailable".into()));
+        #[cfg(feature = "crypto")]
+        if workspace
+            .checked_add(65536)
+            .is_none_or(|bytes| bytes > limits.max_active_workspace_bytes)
+        {
+            return Err(Error::ResourceLimit("7z encrypted encoder workspace"));
+        }
+    }
     if options.encrypt_headers && options.password.is_none() {
         return Err(Error::Unsupported(
             "encrypted 7z headers require password".into(),
@@ -1586,36 +1753,74 @@ pub(crate) fn write<W: Write + Seek>(
     output.write_all(&[0; 32])?;
     let mut folders = Vec::new();
     let mut packed = 0u64;
-    for entry in entries {
-        if !matches!(entry.kind, EntryKind::File | EntryKind::Directory) {
+    for (index, entry) in entries.iter().enumerate() {
+        if !matches!(entry.source_kind(), EntryKind::File | EntryKind::Directory) {
             return Err(Error::Unsupported("7z links or special files".into()));
         }
-        if entry.kind == EntryKind::Directory || entry.data.is_empty() {
+        if entry.source_kind() == EntryKind::Directory {
             continue;
         }
-        if entry.kind != EntryKind::File {
-            return Err(Error::Unsupported("7z links or special files".into()));
+        let mut source = open(index)?;
+        if entry.source_size() == 0 {
+            if source.read(&mut [0u8; 1])? != 0 {
+                return Err(malformed("creation source size changed"));
+            }
+            continue;
         }
-        let (mut encoded, coder) = encode_payload(&entry.data, options.sevenz_compression)?;
-        let compressed = encoded.len() as u64;
-        let mut coders = vec![coder];
-        let mut sizes = vec![entry.data.len() as u64];
-        if options.password.is_some() {
-            coders.insert(0, encrypt(&mut encoded, options)?);
-            sizes.insert(0, compressed);
+        let mut input = InputStats {
+            input: source.by_ref().take(entry.source_size()),
+            bytes: 0,
+            crc: 0,
+        };
+        let mut packed_output = OutputStats::new(&mut output);
+        let (coders, sizes) = if options.password.is_some() {
+            #[cfg(feature = "crypto")]
+            {
+                let (mut encryptor, encryption) =
+                    EncryptWriter::new(&mut packed_output, options, limits)?;
+                let mut compressed = OutputStats::new(&mut encryptor);
+                let coder = encode_payload(
+                    &mut input,
+                    &mut compressed,
+                    options.sevenz_compression,
+                    limits,
+                )?;
+                let compressed_size = compressed.bytes;
+                encryptor.finish()?;
+                (
+                    vec![encryption, coder],
+                    vec![compressed_size, entry.source_size()],
+                )
+            }
+            #[cfg(not(feature = "crypto"))]
+            return Err(Error::Unsupported("7z crypto feature unavailable".into()));
+        } else {
+            (
+                vec![encode_payload(
+                    &mut input,
+                    &mut packed_output,
+                    options.sevenz_compression,
+                    limits,
+                )?],
+                vec![entry.source_size()],
+            )
+        };
+        if input.bytes != entry.source_size() {
+            return Err(malformed("creation source size changed"));
         }
-        let crc = crc32(0, &entry.data);
-        let pack_crc = crc32(0, &encoded);
-        output.write_all(&encoded)?;
+        let crc = input.crc;
+        if source.read(&mut [0u8; 1])? != 0 {
+            return Err(malformed("creation source size changed"));
+        }
         folders.push(WrittenFolder {
             coders,
             sizes,
             crc,
-            pack: encoded.len() as u64,
-            pack_crc,
+            pack: packed_output.bytes,
+            pack_crc: packed_output.crc,
         });
         packed = packed
-            .checked_add(encoded.len() as u64)
+            .checked_add(packed_output.bytes)
             .ok_or(Error::ResourceLimit("7z writer packed bytes"))?;
     }
     let mut header = vec![1];
@@ -1627,7 +1832,7 @@ pub(crate) fn write<W: Write + Seek>(
     number(&mut header, entries.len() as u64);
     let empty: Vec<_> = entries
         .iter()
-        .map(|e| e.kind == EntryKind::Directory || e.data.is_empty())
+        .map(|e| e.source_kind() == EntryKind::Directory || e.source_size() == 0)
         .collect();
     if empty.iter().any(|e| *e) {
         let mut flags = Vec::new();
@@ -1637,7 +1842,7 @@ pub(crate) fn write<W: Write + Seek>(
             .iter()
             .zip(&empty)
             .filter(|(_, empty)| **empty)
-            .map(|(e, _)| e.kind == EntryKind::File)
+            .map(|(e, _)| e.source_kind() == EntryKind::File)
             .collect();
         flags.clear();
         bits(&mut flags, &empty_files);
@@ -1645,10 +1850,10 @@ pub(crate) fn write<W: Write + Seek>(
     }
     let mut names = vec![0];
     for e in entries {
-        if e.name.contains('\0') {
+        if e.source_name().contains('\0') {
             return Err(malformed("7z filename NUL"));
         }
-        for word in e.name.encode_utf16() {
+        for word in e.source_name().encode_utf16() {
             names.extend_from_slice(&word.to_le_bytes());
         }
         names.extend_from_slice(&[0, 0]);
@@ -1686,7 +1891,7 @@ pub(crate) fn write<W: Write + Seek>(
             if let Some(mode) = metadata.unix_mode {
                 let attributes = (mode << 16)
                     | 0x8000
-                    | if entry.kind == EntryKind::Directory {
+                    | if entry.source_kind() == EntryKind::Directory {
                         0x10
                     } else {
                         0x20
@@ -1699,20 +1904,27 @@ pub(crate) fn write<W: Write + Seek>(
     }
     header.extend_from_slice(&[0, 0]);
     if options.encrypt_headers {
-        let unpack = header.len() as u64;
-        let crc = crc32(0, &header);
-        let coder = encrypt(&mut header, options)?;
-        let info = WrittenFolder {
-            coders: vec![coder],
-            sizes: vec![unpack],
-            crc,
-            pack: header.len() as u64,
-            pack_crc: crc32(0, &header),
-        };
-        output.write_all(&header)?;
-        let mut wrapper = vec![23];
-        write_streams(&mut wrapper, &[info], packed);
-        header = wrapper;
+        #[cfg(feature = "crypto")]
+        {
+            let unpack = header.len() as u64;
+            let crc = crc32(0, &header);
+            let mut packed_output = OutputStats::new(&mut output);
+            let (mut encryptor, coder) = EncryptWriter::new(&mut packed_output, options, limits)?;
+            encryptor.write_all(&header)?;
+            encryptor.finish()?;
+            let info = WrittenFolder {
+                coders: vec![coder],
+                sizes: vec![unpack],
+                crc,
+                pack: packed_output.bytes,
+                pack_crc: packed_output.crc,
+            };
+            let mut wrapper = vec![23];
+            write_streams(&mut wrapper, &[info], packed);
+            header = wrapper;
+        }
+        #[cfg(not(feature = "crypto"))]
+        return Err(Error::Unsupported("7z crypto feature unavailable".into()));
     }
     let position = output.stream_position()?;
     output.write_all(&header)?;
@@ -1732,7 +1944,14 @@ pub(crate) fn write<W: Write + Seek>(
 mod brotli_tests {
     use super::*;
     fn frame(data: &[u8]) -> Vec<u8> {
-        let (encoded, _) = encode_payload(data, crate::SevenZipCompression::Brotli).unwrap();
+        let mut encoded = Vec::new();
+        encode_payload(
+            &mut io::Cursor::new(data),
+            &mut encoded,
+            crate::SevenZipCompression::Brotli,
+            Limits::default(),
+        )
+        .unwrap();
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&0x184d2a50u32.to_le_bytes());
         bytes.extend_from_slice(&8u32.to_le_bytes());

@@ -99,6 +99,17 @@ pub(crate) fn extract_selected<R: Read + Seek>(
     ids: &[EntryId],
     sink: &mut impl FnMut(EntryId, &[u8]) -> Result<()>,
 ) -> Result<crate::ExtractReport> {
+    extract_selected_cancellable(backend, ids, &|| false, sink)
+}
+pub(crate) fn extract_selected_cancellable<R: Read + Seek>(
+    backend: &mut SevenZip<R>,
+    ids: &[EntryId],
+    cancelled: &impl Fn() -> bool,
+    sink: &mut impl FnMut(EntryId, &[u8]) -> Result<()>,
+) -> Result<crate::ExtractReport> {
+    if cancelled() {
+        return Err(Error::Cancelled);
+    }
     let (selected, folders, bytes) = selected_folders(backend, ids)?;
     let mut total = 0u64;
     for folder in folders {
@@ -112,7 +123,7 @@ pub(crate) fn extract_selected<R: Read + Seek>(
                     limit: backend.limits.max_total_bytes.saturating_sub(total),
                 },
                 folder,
-                &|| false,
+                cancelled,
                 sink,
             )?)
             .ok_or(Error::ResourceLimit("7z decoded operation bytes"))?;
@@ -160,14 +171,7 @@ fn folder_workspace(block: &container::Folder) -> Result<u64> {
             [3, 3, 1, 0x1b] => 4 * 65536,
             container::BZIP2 => 16 * 1024 * 1024,
             container::BROTLI => container::BROTLI_WORKSPACE,
-            container::DEFLATE => block
-                .unpack_sizes
-                .iter()
-                .copied()
-                .max()
-                .unwrap_or(0)
-                .checked_add(1 << 20)
-                .ok_or(Error::ResourceLimit("7z DEFLATE workspace"))?,
+            container::DEFLATE => 1 << 20,
             _ => 65536,
         };
         bytes = bytes
@@ -574,14 +578,33 @@ pub(crate) fn create<W: Write + Seek>(
     entries: &[CreateEntry],
     output: W,
     options: &mut CreateOptions<'_>,
+    limits: Limits,
 ) -> Result<()> {
-    container::write(entries, output, options)
+    container::write(entries, output, options, limits)
+}
+
+pub(crate) fn create_readers<'a, E: crate::CreationEntry>(
+    entries: &[E],
+    open: &mut impl FnMut(usize) -> Result<Box<dyn Read + 'a>>,
+    output: impl Write + Seek,
+    options: &mut CreateOptions<'_>,
+    limits: Limits,
+) -> Result<()> {
+    container::write_readers(entries, open, output, options, limits)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
+    fn create<W: Write + Seek>(
+        entries: &[CreateEntry],
+        output: W,
+        options: &mut CreateOptions<'_>,
+    ) -> Result<()> {
+        super::create(entries, output, options, Limits::default())
+    }
+
     #[test]
     fn selectable_writer_codecs_roundtrip_and_report_exact_method() {
         use crate::SevenZipCompression;

@@ -5,7 +5,7 @@ use std::{
 };
 
 struct Output {
-    name: Vec<u8>,
+    name: archive_fs::ValidatedPath,
     offset: u64,
     expected: u64,
     written: u64,
@@ -19,7 +19,7 @@ pub(crate) struct BatchSpool {
     outputs: BTreeMap<usize, Output>,
     names: std::collections::BTreeSet<String>,
     end: u64,
-    directories: Vec<(Vec<u8>, archive_core::EntryMetadata)>,
+    directories: Vec<(archive_fs::ValidatedPath, archive_core::EntryMetadata)>,
 }
 
 impl BatchSpool {
@@ -34,7 +34,16 @@ impl BatchSpool {
     }
 
     pub(crate) fn stage(&mut self, id: usize, name: &[u8], size: u64) -> io::Result<()> {
-        let key = archive_fs::validate_name(name)?.join("/").to_lowercase();
+        self.stage_validated(id, archive_fs::ValidatedPath::new(name)?, size)
+    }
+
+    pub(crate) fn stage_validated(
+        &mut self,
+        id: usize,
+        name: archive_fs::ValidatedPath,
+        size: u64,
+    ) -> io::Result<()> {
+        let key = name.collision_key().to_owned();
         if self.outputs.contains_key(&id) || !self.names.insert(key) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -48,7 +57,7 @@ impl BatchSpool {
         self.outputs.insert(
             id,
             Output {
-                name: name.to_vec(),
+                name,
                 offset: self.end,
                 expected: size,
                 written: 0,
@@ -95,8 +104,17 @@ impl BatchSpool {
         &mut self,
         name: &[u8],
         metadata: archive_core::EntryMetadata,
+    ) -> io::Result<()> {
+        self.directory_metadata_validated(archive_fs::ValidatedPath::new(name)?, metadata);
+        Ok(())
+    }
+
+    pub(crate) fn directory_metadata_validated(
+        &mut self,
+        name: archive_fs::ValidatedPath,
+        metadata: archive_core::EntryMetadata,
     ) {
-        self.directories.push((name.to_vec(), metadata));
+        self.directories.push((name, metadata));
     }
 
     pub(crate) fn complete(&self) -> bool {
@@ -120,7 +138,7 @@ impl BatchSpool {
         for output in self.outputs.into_values() {
             check_cancelled()?;
             self.file.seek(SeekFrom::Start(output.offset))?;
-            destination.file_with_metadata(&output.name, &output.metadata, |sink| {
+            destination.file_with_validated_metadata(&output.name, &output.metadata, |sink| {
                 let bytes = io::copy(
                     &mut (&mut self.file).take(output.expected),
                     &mut CancellableSink(sink),
@@ -133,12 +151,11 @@ impl BatchSpool {
             })?;
             published();
         }
-        self.directories.sort_by_key(|(name, _)| {
-            std::cmp::Reverse(name.iter().filter(|byte| **byte == b'/').count())
-        });
+        self.directories
+            .sort_by_key(|(name, _)| std::cmp::Reverse(name.depth()));
         for (name, metadata) in self.directories {
             check_cancelled()?;
-            destination.directory_metadata(&name, &metadata)?;
+            destination.directory_metadata_validated(&name, &metadata)?;
         }
         Ok(())
     }

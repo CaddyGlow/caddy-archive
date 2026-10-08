@@ -5,8 +5,10 @@ pub(crate) fn operation(
     limits: Limits,
 ) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
     if matches!(cli.view, Some(OpticalView::Udf)) {
-        let archive =
-            archive_core::udf::UdfArchive::open_reader(std::fs::File::open(path)?, limits)?;
+        let archive = archive_core::udf::UdfArchive::open_reader(
+            CancellableSource(std::fs::File::open(path)?),
+            limits,
+        )?;
         let result = match &cli.command {
             Command::List { .. } => {
                 if !cli.json {

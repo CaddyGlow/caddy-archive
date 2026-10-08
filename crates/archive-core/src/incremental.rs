@@ -7,9 +7,12 @@ use ms_compress::zlib::{Inflate, InflateFlush, Status, crc32::crc32};
 use std::{
     cell::RefCell,
     collections::BTreeMap,
-    io::{self, Read, Seek, SeekFrom},
+    io::{Read, Seek},
     rc::Rc,
 };
+
+#[cfg(feature = "zip")]
+use std::io::{self, SeekFrom};
 
 /// Maximum input consumed or output produced in one cooperative step.
 pub const STEP_BYTES: usize = 65536;
@@ -250,19 +253,29 @@ pub enum IndexPoll {
     Ready,
 }
 struct Cache {
+    #[cfg(feature = "zip")]
     length: u64,
     ranges: BTreeMap<u64, Vec<u8>>,
     pending: Option<RangeRequest>,
     bytes: u64,
     limit: u64,
+    exhausted: bool,
+    #[cfg(test)]
+    reads: usize,
 }
+#[cfg(feature = "zip")]
 struct CachedReader {
     cache: Rc<RefCell<Cache>>,
     position: u64,
 }
+#[cfg(feature = "zip")]
 impl Read for CachedReader {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         let mut cache = self.cache.borrow_mut();
+        #[cfg(test)]
+        {
+            cache.reads += 1;
+        }
         if self.position >= cache.length || output.is_empty() {
             return Ok(0);
         }
@@ -276,10 +289,28 @@ impl Read for CachedReader {
                 return Ok(count);
             }
         }
-        let length = output.len().min(STEP_BYTES).min(
-            usize::try_from((cache.length - self.position).min(STEP_BYTES as u64))
-                .map_err(|_| io::Error::other("range length conversion"))?,
-        );
+        // Coalesce nearby metadata reads, bounded by the next cached range and
+        // the remaining cache budget. Never refetch overlapping cached bytes.
+        let next = cache
+            .ranges
+            .range(self.position..)
+            .next()
+            .map_or(cache.length, |(&offset, _)| offset);
+        let available = next
+            .saturating_sub(self.position)
+            .min(cache.limit.saturating_sub(cache.bytes));
+        if available == 0 {
+            cache.exhausted = true;
+            return Err(io::Error::other("range metadata cache exhausted"));
+        }
+        let length = output
+            .len()
+            .clamp(256, STEP_BYTES)
+            .min(available.min(STEP_BYTES as u64) as usize)
+            .min(
+                usize::try_from((cache.length - self.position).min(STEP_BYTES as u64))
+                    .map_err(|_| io::Error::other("range length conversion"))?,
+            );
         cache.pending = Some(RangeRequest {
             offset: self.position,
             length,
@@ -287,6 +318,7 @@ impl Read for CachedReader {
         Err(io::ErrorKind::WouldBlock.into())
     }
 }
+#[cfg(feature = "zip")]
 impl Seek for CachedReader {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         self.position = match pos {
@@ -311,7 +343,13 @@ pub struct RangeIndex {
     cache: Rc<RefCell<Cache>>,
     limits: Limits,
     entries: Option<Vec<Entry>>,
-    plans: Vec<EntryRange>,
+    plans: Vec<Option<EntryRange>>,
+    #[cfg(feature = "zip")]
+    preflight: Option<crate::zip_backend::Preflight>,
+    #[cfg(feature = "zip")]
+    prefetched: u64,
+    #[cfg(feature = "zip")]
+    parser: Option<crate::zip_backend::Indexer<CachedReader>>,
 }
 impl RangeIndex {
     /// Start indexing an immutable byte source by its declared length.
@@ -321,15 +359,25 @@ impl RangeIndex {
         }
         Ok(Self {
             cache: Rc::new(RefCell::new(Cache {
+                #[cfg(feature = "zip")]
                 length,
                 ranges: BTreeMap::new(),
                 pending: None,
                 bytes: 0,
                 limit: limits.max_metadata_bytes,
+                exhausted: false,
+                #[cfg(test)]
+                reads: 0,
             })),
             limits,
             entries: None,
             plans: Vec::new(),
+            #[cfg(feature = "zip")]
+            preflight: None,
+            #[cfg(feature = "zip")]
+            prefetched: 0,
+            #[cfg(feature = "zip")]
+            parser: None,
         })
     }
     /// Poll the parser. A missing range is returned, never read through a JS callback.
@@ -337,50 +385,95 @@ impl RangeIndex {
         if self.entries.is_some() {
             return Ok(IndexPoll::Ready);
         }
-        self.cache.borrow_mut().pending = None;
-        let reader = CachedReader {
-            cache: self.cache.clone(),
-            position: 0,
-        };
+        {
+            let mut cache = self.cache.borrow_mut();
+            cache.pending = None;
+            cache.exhausted = false;
+        }
         #[cfg(feature = "zip")]
-        match crate::zip_backend::index(reader, self.limits) {
-            Ok((_, entries, locations)) => {
-                crate::validate_index(&entries, self.limits)?;
-                self.plans = entries
-                    .iter()
-                    .zip(&locations)
-                    .filter(|(e, l)| {
-                        e.kind == crate::EntryKind::File
-                            && !l.encrypted
-                            && matches!(l.method, 0 | 8)
-                    })
-                    .map(|(e, l)| EntryRange {
-                        id: e.id,
-                        offset: l.offset,
-                        compressed_bytes: l.compressed,
-                        decoded_bytes: e.size,
-                        method: l.method,
-                        crc32: l.crc,
-                    })
-                    .collect();
-                self.entries = Some(entries);
-                self.cache.borrow_mut().ranges.clear();
-                self.cache.borrow_mut().bytes = 0;
-                Ok(IndexPoll::Ready)
-            }
+        let result = self.advance();
+        #[cfg(not(feature = "zip"))]
+        let result = Err(Error::Unsupported("ZIP feature unavailable".into()));
+        match result {
+            Ok(()) => Ok(IndexPoll::Ready),
             Err(error) => {
                 if let Some(request) = self.cache.borrow().pending {
                     Ok(IndexPoll::NeedRange(request))
+                } else if self.cache.borrow().exhausted {
+                    Err(Error::ResourceLimit("range metadata cache"))
                 } else {
                     Err(error)
                 }
             }
         }
-        #[cfg(not(feature = "zip"))]
-        {
-            let _ = reader;
-            Err(Error::Unsupported("ZIP feature unavailable".into()))
+    }
+    #[cfg(feature = "zip")]
+    fn advance(&mut self) -> Result<()> {
+        if self.parser.is_none() {
+            let mut reader = CachedReader {
+                cache: Rc::clone(&self.cache),
+                position: 0,
+            };
+            if self.preflight.is_none() {
+                self.preflight = Some(crate::zip_backend::preflight(&mut reader, self.limits)?);
+            }
+            let preflight = self
+                .preflight
+                .as_ref()
+                .ok_or_else(|| Error::Malformed("ZIP preflight state".into()))?;
+            // Fetch the directory sequentially before asking the dependency to
+            // parse it. Each successful read advances this cursor, so even a
+            // directory spanning many requests is parsed only once.
+            reader.seek(SeekFrom::Start(preflight.directory_start + self.prefetched))?;
+            let mut scratch = [0; STEP_BYTES];
+            while self.prefetched < preflight.directory_size {
+                let count =
+                    (preflight.directory_size - self.prefetched).min(STEP_BYTES as u64) as usize;
+                let read = reader.read(&mut scratch[..count])?;
+                if read == 0 {
+                    return Err(Error::Malformed("truncated ZIP central directory".into()));
+                }
+                self.prefetched += read as u64;
+            }
+            self.parser = Some(crate::zip_backend::Indexer::new(
+                reader,
+                self.limits,
+                preflight.entries,
+            )?);
         }
+        let parser = self
+            .parser
+            .as_mut()
+            .ok_or_else(|| Error::Malformed("ZIP parser state".into()))?;
+        parser.poll()?;
+        let (_, entries, locations) = self
+            .parser
+            .take()
+            .ok_or_else(|| Error::Malformed("ZIP parser state".into()))?
+            .finish()?;
+        crate::validate_index(&entries, self.limits)?;
+        self.plans = entries
+            .iter()
+            .zip(&locations)
+            .map(|(entry, location)| {
+                (entry.kind == crate::EntryKind::File
+                    && !location.encrypted
+                    && matches!(location.method, 0 | 8))
+                .then_some(EntryRange {
+                    id: entry.id,
+                    offset: location.offset,
+                    compressed_bytes: location.compressed,
+                    decoded_bytes: entry.size,
+                    method: location.method,
+                    crc32: location.crc,
+                })
+            })
+            .collect();
+        self.entries = Some(entries);
+        let mut cache = self.cache.borrow_mut();
+        cache.ranges.clear();
+        cache.bytes = 0;
+        Ok(())
     }
     /// Supply exactly the requested immutable source range under the metadata budget.
     pub fn supply(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
@@ -415,16 +508,12 @@ impl RangeIndex {
     }
     /// Obtain a supported incremental decoded-entry contract.
     pub fn entry_range(&self, id: EntryId) -> Result<EntryRange> {
-        self.plans
-            .iter()
-            .find(|e| e.id == id)
-            .cloned()
-            .ok_or_else(|| {
-                Error::Unsupported(
-                    "incremental entry requires an unencrypted regular stored/DEFLATE ZIP member"
-                        .into(),
-                )
-            })
+        self.plans.get(id.0).and_then(Clone::clone).ok_or_else(|| {
+            Error::Unsupported(
+                "incremental entry requires an unencrypted regular stored/DEFLATE ZIP member"
+                    .into(),
+            )
+        })
     }
     /// Create a decoder after indexing, without copying compressed entry data.
     pub fn decoder(&self, id: EntryId) -> Result<EntryDecoder> {
@@ -439,6 +528,130 @@ impl RangeIndex {
 #[cfg(all(test, feature = "zip"))]
 mod tests {
     use super::*;
+    fn stored_zip(count: usize) -> Vec<u8> {
+        use std::io::Write;
+        let mut writer = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for index in 0..count {
+            writer
+                .start_file(format!("{index:08}-{}", "n".repeat(100)), options)
+                .unwrap();
+            writer.write_all(&[42; 8192]).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+    fn supply_all(index: &mut RangeIndex, zip: &[u8]) -> Result<(usize, usize)> {
+        let mut requests = 0;
+        let mut fetched = 0;
+        while let IndexPoll::NeedRange(range) = index.poll()? {
+            requests += 1;
+            fetched += range.length;
+            assert!(range.length <= STEP_BYTES);
+            index.supply(
+                range.offset,
+                &zip[range.offset as usize..range.offset as usize + range.length],
+            )?;
+        }
+        Ok((requests, fetched))
+    }
+    #[test]
+    fn sparse_entry_plans_preserve_ids_across_unsupported_entries() {
+        use std::io::Write;
+        let mut writer = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        writer.add_directory("directory/", options).unwrap();
+        writer.start_file("directory/file", options).unwrap();
+        writer.write_all(b"payload").unwrap();
+        let zip = writer.finish().unwrap().into_inner();
+        let mut index = RangeIndex::new(zip.len() as u64, Limits::default()).unwrap();
+        supply_all(&mut index, &zip).unwrap();
+        assert!(index.entry_range(EntryId(0)).is_err());
+        assert_eq!(index.entry_range(EntryId(1)).unwrap().id, EntryId(1));
+        assert!(index.entry_range(EntryId(2)).is_err());
+    }
+    #[test]
+    fn sparse_many_member_index_has_linear_reads_and_coalesces_headers() {
+        for count in [400, 1600] {
+            let zip = stored_zip(count);
+            let mut index = RangeIndex::new(zip.len() as u64, Limits::default()).unwrap();
+            let (requests, fetched) = supply_all(&mut index, &zip).unwrap();
+            assert_eq!(index.entries().unwrap().len(), count);
+            assert!(
+                requests < count + 32,
+                "{count} entries needed {requests} requests"
+            );
+            let reads = index.cache.borrow().reads;
+            assert!(
+                reads < count * 16 + 128,
+                "{count} entries needed {reads} parser reads"
+            );
+            assert!(fetched < count * 512 + 65557, "{fetched} fetched bytes");
+            assert_eq!(index.cached_bytes(), 0);
+            assert_eq!(
+                index.entry_range(EntryId(count - 1)).unwrap().id,
+                EntryId(count - 1)
+            );
+        }
+    }
+    #[test]
+    fn sparse_index_rejects_local_name_and_method_mismatches_after_resumption() {
+        for offset in [8, 30] {
+            let mut zip = stored_zip(400);
+            zip[offset] ^= 1;
+            let mut index = RangeIndex::new(zip.len() as u64, Limits::default()).unwrap();
+            assert!(matches!(
+                supply_all(&mut index, &zip),
+                Err(Error::Malformed(_))
+            ));
+            assert!(index.entries().is_err());
+        }
+    }
+    #[test]
+    fn sparse_index_rejects_overlapping_members_and_duplicate_names() {
+        let mut overlapping = stored_zip(400);
+        let central = overlapping
+            .windows(4)
+            .position(|v| v == b"PK\x01\x02")
+            .unwrap();
+        overlapping[central + 20..central + 24].copy_from_slice(&8193u32.to_le_bytes());
+        let mut index = RangeIndex::new(overlapping.len() as u64, Limits::default()).unwrap();
+        assert!(matches!(supply_all(&mut index, &overlapping),
+            Err(Error::Malformed(message)) if message == "overlapping ZIP members"));
+
+        let mut duplicate = stored_zip(400);
+        let positions: Vec<_> = duplicate
+            .windows(8)
+            .enumerate()
+            .filter_map(|(index, bytes)| (bytes == b"00000001").then_some(index))
+            .collect();
+        for position in positions {
+            duplicate[position..position + 8].copy_from_slice(b"00000000");
+        }
+        let mut index = RangeIndex::new(duplicate.len() as u64, Limits::default()).unwrap();
+        assert!(matches!(
+            supply_all(&mut index, &duplicate),
+            Err(Error::Unsupported(_))
+        ));
+    }
+    #[test]
+    fn sparse_index_respects_cache_budget_before_requesting_more_bytes() {
+        let zip = stored_zip(10);
+        let mut index = RangeIndex::new(
+            zip.len() as u64,
+            Limits {
+                max_metadata_bytes: 1024,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            supply_all(&mut index, &zip),
+            Err(Error::ResourceLimit(_))
+        ));
+        assert!(index.cached_bytes() <= 1024);
+    }
     #[test]
     fn range_index_enforces_archive_wide_limits_before_ready() {
         let entries = [
@@ -578,7 +791,7 @@ mod tests {
         );
     }
     #[test]
-    fn sparse_range_index_never_caches_payload_and_releases_metadata() {
+    fn sparse_range_index_avoids_whole_payload_and_releases_metadata() {
         let payload = vec![7u8; 4 * 1024 * 1024];
         let mut zip = std::io::Cursor::new(Vec::new());
         crate::create(

@@ -65,7 +65,7 @@ pub(crate) fn stdin_operation(
                     pending
                         .as_mut()
                         .ok_or("missing provisional spool")?
-                        .directory_metadata(&entry.raw_name, archive.current_metadata()?);
+                        .directory_metadata(&entry.raw_name, archive.current_metadata()?)?;
                     archive.skip_current()?
                 }
                 EntryKind::File => {

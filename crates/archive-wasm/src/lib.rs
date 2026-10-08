@@ -100,11 +100,12 @@ pub fn create_encrypted_archive_file(
     maximum: u64,
     encrypt_headers: bool,
 ) -> Result<Vec<u8>, JsValue> {
-    let format = match format {
-        "zip" => Format::Zip,
-        "7z" => Format::SevenZip,
-        _ => return Err(JsValue::from_str("unsupported encrypted format")),
-    };
+    let format: Format = format
+        .parse()
+        .map_err(|error: archive_core::Error| JsValue::from_str(&error.to_string()))?;
+    if !matches!(format, Format::Zip | Format::SevenZip) {
+        return Err(JsValue::from_str("unsupported encrypted format"));
+    }
     if data.len() as u64 > maximum {
         return Err(JsValue::from_str("decoded byte budget exceeded"));
     }
@@ -164,25 +165,15 @@ impl ByteArchive {
         if bytes.len() as u64 > maximum {
             return Err(JsValue::from_str("input byte budget exceeded"));
         }
-        let selected = match format {
-            "gzip" | "gz" => Format::Gzip,
-            "zlib" => Format::Zlib,
-            "deflate" => Format::Deflate,
-            "lzma" => Format::Lzma,
-            "bzip2" | "bz2" => Format::Bzip2,
-            "brotli" | "br" => Format::Brotli,
-            "tar.bz2" | "tbz2" => Format::TarBzip2,
-            "tar.br" => Format::TarBrotli,
-            "xz" => Format::Xz,
-            "tar" => Format::Tar,
-            "tar.gz" => Format::TarGzip,
-            "tar.xz" => Format::TarXz,
-            "zip" => Format::Zip,
-            "7z" => Format::SevenZip,
-            "cab" => Format::Cab,
-            "iso" => Format::Iso,
-            _ => return Err(JsValue::from_str("unsupported interpretation")),
-        };
+        let selected: Format = format
+            .parse()
+            .map_err(|error: archive_core::Error| JsValue::from_str(&error.to_string()))?;
+        if matches!(
+            selected,
+            Format::Wim | Format::Udf | Format::Appx | Format::Msix | Format::Msi
+        ) {
+            return Err(JsValue::from_str("unsupported interpretation"));
+        }
         let limits = Limits {
             max_input_bytes: maximum,
             max_entry_bytes: maximum,
@@ -241,24 +232,12 @@ pub fn create_file(
     if data.len() as u64 > maximum {
         return Err(JsValue::from_str("decoded byte budget exceeded"));
     }
-    let format = match format {
-        "zip" => Format::Zip,
-        "tar" => Format::Tar,
-        "tar.gz" | "tgz" => Format::TarGzip,
-        "cab" => Format::Cab,
-        "7z" => Format::SevenZip,
-        "xz" => Format::Xz,
-        "tar.xz" => Format::TarXz,
-        "gzip" | "gz" => Format::Gzip,
-        "zlib" => Format::Zlib,
-        "deflate" => Format::Deflate,
-        "lzma" => Format::Lzma,
-        "bzip2" | "bz2" => Format::Bzip2,
-        "brotli" | "br" => Format::Brotli,
-        "tar.bz2" | "tbz2" => Format::TarBzip2,
-        "tar.br" => Format::TarBrotli,
-        _ => return Err(JsValue::from_str("unsupported creation format")),
-    };
+    let format: Format = format
+        .parse()
+        .map_err(|error: archive_core::Error| JsValue::from_str(&error.to_string()))?;
+    if !archive_core::capabilities(format).write {
+        return Err(JsValue::from_str("unsupported creation format"));
+    }
     let entry = CreateEntry {
         name: name.to_owned(),
         data: data.to_vec(),

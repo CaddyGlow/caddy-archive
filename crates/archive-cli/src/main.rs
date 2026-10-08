@@ -1,5 +1,6 @@
 use archive_core::{Archive, CreateEntry, EntryKind, Format, Limits};
 mod formats;
+mod memory;
 mod optical;
 mod package_compat;
 #[cfg(feature = "progress")]
@@ -55,7 +56,7 @@ fn install_interrupt_handler() {
         SetConsoleCtrlHandler(Some(console_interrupt), 1);
     }
 }
-struct CancellableSink<'a>(&'a mut std::fs::File);
+struct CancellableSink<W>(W);
 struct CancellableSource<R>(R);
 impl<R: io::Read> io::Read for CancellableSource<R> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
@@ -63,14 +64,37 @@ impl<R: io::Read> io::Read for CancellableSource<R> {
         self.0.read(bytes)
     }
 }
-impl io::Write for CancellableSink<'_> {
+impl<W: io::Write> io::Write for CancellableSink<W> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         check_cancelled()?;
-        io::Write::write(self.0, bytes)
+        io::Write::write(&mut self.0, bytes)
     }
     fn flush(&mut self) -> io::Result<()> {
         check_cancelled()?;
-        io::Write::flush(self.0)
+        io::Write::flush(&mut self.0)
+    }
+}
+
+impl<R: io::Seek> io::Seek for CancellableSource<R> {
+    fn seek(&mut self, position: io::SeekFrom) -> io::Result<u64> {
+        check_cancelled()?;
+        self.0.seek(position)
+    }
+}
+impl<W: io::Seek> io::Seek for CancellableSink<W> {
+    fn seek(&mut self, position: io::SeekFrom) -> io::Result<u64> {
+        check_cancelled()?;
+        self.0.seek(position)
+    }
+}
+impl<R: io::Write> io::Write for CancellableSource<R> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        check_cancelled()?;
+        self.0.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        check_cancelled()?;
+        self.0.flush()
     }
 }
 
@@ -104,6 +128,15 @@ struct Cli {
     max_total_bytes: u64,
     #[arg(long, global = true, default_value_t = 100_000)]
     max_entries: u64,
+    /// Codec memory budget: auto, p80, 80%, or an integer with b/k/m/g/t suffix.
+    #[arg(long, visible_alias = "mmemuse", global = true, default_value = "auto")]
+    memuse: archive_core::MemoryUsage,
+    /// Optional tighter ceiling on codec workspace, in bytes.
+    #[arg(long, global = true)]
+    max_codec_workspace_bytes: Option<u64>,
+    /// Optional tighter ceiling on codec dictionaries, in bytes.
+    #[arg(long, global = true)]
+    max_dictionary_bytes: Option<u64>,
     #[arg(short = 'P', long, global = true, value_enum, default_value = "auto")]
     progress: Progress,
     #[command(subcommand)]
@@ -243,7 +276,7 @@ enum Command {
         /// Extract into a subfolder named after the archive, without its extension.
         #[arg(short = 's', long)]
         archive_folder: bool,
-        #[arg(short = 't', long, default_value_t = 1)]
+        #[arg(short = 't', long, default_value_t = memory::available_workers())]
         threads: usize,
     },
     #[command(visible_alias = "a")]
@@ -265,9 +298,45 @@ enum Command {
     },
 }
 
+impl Cli {
+    fn limits(&self) -> Limits {
+        let operation = if matches!(
+            self.command,
+            Command::Create { .. } | Command::Compress { .. } | Command::Deflate { .. }
+        ) {
+            archive_core::MemoryOperation::Compress
+        } else {
+            archive_core::MemoryOperation::Decompress
+        };
+        self.limits_with_memory(memory::physical_memory(), operation)
+    }
+
+    fn limits_with_memory(
+        &self,
+        physical_ram: Option<u64>,
+        operation: archive_core::MemoryOperation,
+    ) -> Limits {
+        let budget = self.memuse.budget(physical_ram, operation);
+        Limits {
+            max_input_bytes: self.max_input_bytes,
+            max_entry_bytes: self.max_entry_bytes,
+            max_total_bytes: self.max_total_bytes,
+            max_entries: self.max_entries,
+            max_active_workspace_bytes: self
+                .max_codec_workspace_bytes
+                .map_or(budget, |cap| cap.min(budget)),
+            max_dictionary_bytes: self
+                .max_dictionary_bytes
+                .map_or(budget, |cap| cap.min(budget)),
+            max_workers: memory::available_workers(),
+            ..Limits::default()
+        }
+    }
+}
+
 fn main() {
     install_interrupt_handler();
-    let args = tar_args::expand(std::env::args_os().collect());
+    let args = tar_args::expand(memory::normalize_args(std::env::args_os().collect()));
     let mut cli = match args.and_then(Cli::try_parse_from) {
         Ok(cli) => cli,
         Err(error) => {
@@ -375,13 +444,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let _ = enabled;
-    let limits = Limits {
-        max_input_bytes: cli.max_input_bytes,
-        max_entry_bytes: cli.max_entry_bytes,
-        max_total_bytes: cli.max_total_bytes,
-        max_entries: cli.max_entries,
-        ..Limits::default()
-    };
+    let limits = cli.limits();
     let result = match &cli.command {
         Command::Compress { output, .. } | Command::Decompress { output, .. } => {
             let result = single_file::run(cli, limits)?;
@@ -559,14 +622,29 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 })
                 .collect::<io::Result<_>>()?;
+            let mut open = |index: usize| -> archive_core::Result<Box<dyn io::Read>> {
+                open_creation_source(input, &entries[index])
+            };
             if output == Path::new("-") {
-                archive_core::create_stream_with_metadata(
-                    format,
-                    &entries,
-                    &mut io::stdout().lock(),
-                    limits,
-                    &metadata,
-                )?;
+                if matches!(format, Format::Tar | Format::TarGzip | Format::TarXz) {
+                    archive_core::create_stream_from_readers(
+                        format,
+                        &entries,
+                        &mut open,
+                        &mut CancellableSink(io::stdout().lock()),
+                        limits,
+                        Some(&metadata),
+                    )?;
+                } else {
+                    let entries = buffer_creation_sources(&entries, &mut open)?;
+                    archive_core::create_stream_with_metadata(
+                        format,
+                        &entries,
+                        &mut CancellableSink(io::stdout().lock()),
+                        limits,
+                        &metadata,
+                    )?;
+                }
                 return Ok(());
             }
             let parent = output
@@ -579,50 +657,69 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 return Err("--encrypt requires an explicit --password-file source".into());
             }
             let mut randomness = NativeRandom;
-            archive_core::create_with_options(
-                format,
-                &entries,
-                temp.as_file_mut(),
-                limits,
-                archive_core::CreateOptions {
-                    sevenz_compression: match compression.unwrap_or(ArchiveCompression::Lzma2) {
-                        ArchiveCompression::Copy => archive_core::SevenZipCompression::Copy,
-                        ArchiveCompression::Deflate => archive_core::SevenZipCompression::Deflate,
-                        ArchiveCompression::MsZip
-                        | ArchiveCompression::Lzx
-                        | ArchiveCompression::Quantum => {
-                            archive_core::SevenZipCompression::default()
-                        }
-                        ArchiveCompression::Lzma => archive_core::SevenZipCompression::Lzma,
-                        ArchiveCompression::Lzma2 => archive_core::SevenZipCompression::Lzma2,
-                        ArchiveCompression::Bzip2 => archive_core::SevenZipCompression::Bzip2,
-                        ArchiveCompression::Brotli => archive_core::SevenZipCompression::Brotli,
-                    },
-                    zip_compression: if matches!(compression, Some(ArchiveCompression::Copy)) {
-                        archive_core::ZipCompression::Copy
-                    } else {
-                        archive_core::ZipCompression::Deflate
-                    },
-                    cab_compression: match compression {
-                        Some(ArchiveCompression::Copy) => archive_core::CabCompression::Copy,
-                        Some(ArchiveCompression::Lzx) => archive_core::CabCompression::Lzx,
-                        Some(ArchiveCompression::Quantum) => archive_core::CabCompression::Quantum,
-                        _ => archive_core::CabCompression::MsZip,
-                    },
-                    zip_encryption: match zip_encryption {
-                        ZipEncryption::Aes256 => archive_core::ZipEncryption::Aes256,
-                        ZipEncryption::Zipcrypto => archive_core::ZipEncryption::ZipCrypto,
-                    },
-                    encrypt_headers: *encrypt_headers,
-                    password: if *encrypt {
-                        password.as_ref().map(|p| p.0.as_slice())
-                    } else {
-                        None
-                    },
-                    randomness: Some(&mut randomness),
-                    entry_metadata: Some(&metadata),
+            let options = archive_core::CreateOptions {
+                sevenz_compression: match compression.unwrap_or(ArchiveCompression::Lzma2) {
+                    ArchiveCompression::Copy => archive_core::SevenZipCompression::Copy,
+                    ArchiveCompression::Deflate => archive_core::SevenZipCompression::Deflate,
+                    ArchiveCompression::MsZip
+                    | ArchiveCompression::Lzx
+                    | ArchiveCompression::Quantum => archive_core::SevenZipCompression::default(),
+                    ArchiveCompression::Lzma => archive_core::SevenZipCompression::Lzma,
+                    ArchiveCompression::Lzma2 => archive_core::SevenZipCompression::Lzma2,
+                    ArchiveCompression::Bzip2 => archive_core::SevenZipCompression::Bzip2,
+                    ArchiveCompression::Brotli => archive_core::SevenZipCompression::Brotli,
                 },
-            )?;
+                zip_compression: if matches!(compression, Some(ArchiveCompression::Copy)) {
+                    archive_core::ZipCompression::Copy
+                } else {
+                    archive_core::ZipCompression::Deflate
+                },
+                cab_compression: match compression {
+                    Some(ArchiveCompression::Copy) => archive_core::CabCompression::Copy,
+                    Some(ArchiveCompression::Lzx) => archive_core::CabCompression::Lzx,
+                    Some(ArchiveCompression::Quantum) => archive_core::CabCompression::Quantum,
+                    _ => archive_core::CabCompression::MsZip,
+                },
+                zip_encryption: match zip_encryption {
+                    ZipEncryption::Aes256 => archive_core::ZipEncryption::Aes256,
+                    ZipEncryption::Zipcrypto => archive_core::ZipEncryption::ZipCrypto,
+                },
+                encrypt_headers: *encrypt_headers,
+                password: if *encrypt {
+                    password.as_ref().map(|p| p.0.as_slice())
+                } else {
+                    None
+                },
+                randomness: Some(&mut randomness),
+                entry_metadata: Some(&metadata),
+            };
+            if matches!(
+                format,
+                Format::Tar
+                    | Format::TarGzip
+                    | Format::TarXz
+                    | Format::Zip
+                    | Format::SevenZip
+                    | Format::Cab
+            ) {
+                archive_core::create_from_readers(
+                    format,
+                    &entries,
+                    &mut open,
+                    &mut CancellableSink(temp.as_file_mut()),
+                    limits,
+                    options,
+                )?;
+            } else {
+                let entries = buffer_creation_sources(&entries, &mut open)?;
+                archive_core::create_with_options(
+                    format,
+                    &entries,
+                    &mut CancellableSink(temp.as_file_mut()),
+                    limits,
+                    options,
+                )?;
+            }
             check_cancelled()?;
             temp.as_file().sync_all()?;
             temp.persist_noclobber(output)?;
@@ -672,24 +769,24 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .into());
                 }
                 Archive::open_with_scratch(
-                    std::fs::File::open(path)?,
-                    tempfile::tempfile()?,
+                    CancellableSource(std::fs::File::open(path)?),
+                    CancellableSource(tempfile::tempfile()?),
                     limits,
                     Some(format),
                     None,
                 )?
             } else if let Some(password) = &password {
                 Archive::open_with_scratch(
-                    std::fs::File::open(path)?,
-                    tempfile::tempfile()?,
+                    CancellableSource(std::fs::File::open(path)?),
+                    CancellableSource(tempfile::tempfile()?),
                     limits,
                     None,
                     Some(&password.0),
                 )?
             } else {
                 match Archive::open_with_scratch(
-                    std::fs::File::open(path)?,
-                    tempfile::tempfile()?,
+                    CancellableSource(std::fs::File::open(path)?),
+                    CancellableSource(tempfile::tempfile()?),
                     limits,
                     None,
                     None,
@@ -705,8 +802,8 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         });
                         if let Some(format) = hint {
                             Archive::open_with_scratch(
-                                std::fs::File::open(path)?,
-                                tempfile::tempfile()?,
+                                CancellableSource(std::fs::File::open(path)?),
+                                CancellableSource(tempfile::tempfile()?),
                                 limits,
                                 Some(format),
                                 None,
@@ -740,12 +837,18 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 Command::Test { .. } => {
                     #[cfg(feature = "progress")]
                     let report = if let Some(renderer) = &mut bar {
-                        archive.test_observed(&mut renderer.observer)?
+                        archive.test_observed_cancellable(&mut renderer.observer, || {
+                            CANCELLED.load(std::sync::atomic::Ordering::Relaxed)
+                        })?
                     } else {
-                        archive.test()?
+                        archive.test_cancellable(|| {
+                            CANCELLED.load(std::sync::atomic::Ordering::Relaxed)
+                        })?
                     };
                     #[cfg(not(feature = "progress"))]
-                    let report = archive.test()?;
+                    let report = archive.test_cancellable(|| {
+                        CANCELLED.load(std::sync::atomic::Ordering::Relaxed)
+                    })?;
                     serde_json::json!({"schema_version":1,"ok":true,"operation":"test","verified":report.verified,"bytes":report.bytes,"entries":report.entries})
                 }
                 Command::Extract {
@@ -763,14 +866,8 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     // Preflight all names before creating any outputs.
-                    let mut names = std::collections::BTreeSet::new();
+                    let paths = preflight(selected.iter().map(|entry| entry.raw_name.as_slice()))?;
                     for entry in &selected {
-                        let key = archive_fs::validate_name(&entry.raw_name)?
-                            .join("/")
-                            .to_lowercase();
-                        if !names.insert(key) {
-                            return Err("duplicate destination path".into());
-                        }
                         if !matches!(entry.kind, EntryKind::File | EntryKind::Directory) {
                             return Err("links and special files are unsupported".into());
                         }
@@ -780,6 +877,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         extract_batch(
                             &mut archive,
                             &selected,
+                            paths,
                             &mut destination,
                             *threads,
                             &mut renderer.observer,
@@ -788,6 +886,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         extract_batch(
                             &mut archive,
                             &selected,
+                            paths,
                             &mut destination,
                             *threads,
                             &mut archive_core::progress::NoProgress,
@@ -797,6 +896,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let result = extract_batch(
                         &mut archive,
                         &selected,
+                        paths,
                         &mut destination,
                         *threads,
                         &mut archive_core::progress::NoProgress,
@@ -893,7 +993,7 @@ impl archive_core::RandomSource for NativeRandom {
 fn enumerate(
     root: &Path,
     path: &Path,
-    entries: &mut Vec<CreateEntry>,
+    entries: &mut Vec<archive_core::CreateSource>,
     total: &mut u64,
     limits: &Limits,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -913,9 +1013,9 @@ fn enumerate(
             return Err("entry count budget exceeded".into());
         }
         if meta.is_dir() {
-            entries.push(CreateEntry {
+            entries.push(archive_core::CreateSource {
                 name,
-                data: Vec::new(),
+                size: 0,
                 kind: EntryKind::Directory,
             });
         } else if meta.is_file() {
@@ -923,24 +1023,9 @@ fn enumerate(
             if meta.len() > limits.max_entry_bytes || *total > limits.max_total_bytes {
                 return Err("decoded byte budget exceeded".into());
             }
-            let mut options = std::fs::OpenOptions::new();
-            options.read(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.custom_flags(libc_no_follow());
-            }
-            let file = options.open(path)?;
-            let mut data = Vec::new();
-            use std::io::Read;
-            file.take(meta.len().checked_add(1).ok_or("size overflow")?)
-                .read_to_end(&mut data)?;
-            if data.len() as u64 != meta.len() {
-                return Err("input changed during enumeration".into());
-            }
-            entries.push(CreateEntry {
+            entries.push(archive_core::CreateSource {
                 name,
-                data,
+                size: meta.len(),
                 kind: EntryKind::File,
             });
         } else {
@@ -959,6 +1044,58 @@ fn enumerate(
     Ok(())
 }
 
+fn open_creation_source(
+    root: &Path,
+    entry: &archive_core::CreateSource,
+) -> archive_core::Result<Box<dyn io::Read>> {
+    check_cancelled()?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc_no_follow());
+    }
+    let file = options.open(root.join(&entry.name))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() != entry.size {
+        return Err(io::Error::other("input changed during creation").into());
+    }
+    Ok(Box::new(CancellableSource(file)))
+}
+
+fn buffer_creation_sources(
+    sources: &[archive_core::CreateSource],
+    open: &mut impl FnMut(usize) -> archive_core::Result<Box<dyn io::Read>>,
+) -> archive_core::Result<Vec<CreateEntry>> {
+    use io::Read;
+    sources
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let mut data = Vec::new();
+            if entry.kind == EntryKind::File {
+                open(index)?
+                    .take(
+                        entry
+                            .size
+                            .checked_add(1)
+                            .ok_or_else(|| io::Error::other("input size overflow"))?,
+                    )
+                    .read_to_end(&mut data)?;
+                if data.len() as u64 != entry.size {
+                    return Err(io::Error::other("input changed during creation").into());
+                }
+            }
+            Ok(CreateEntry {
+                name: entry.name.clone(),
+                kind: entry.kind,
+                data,
+            })
+        })
+        .collect()
+}
+
 #[cfg(unix)]
 fn libc_no_follow() -> i32 {
     libc::O_NOFOLLOW
@@ -969,8 +1106,9 @@ struct NativeMedia {
     max_input: u64,
 }
 fn extract_batch<O: archive_core::progress::Observer>(
-    archive: &mut Archive<std::fs::File>,
+    archive: &mut Archive<CancellableSource<std::fs::File>>,
     entries: &[archive_core::Entry],
+    paths: Vec<archive_fs::ValidatedPath>,
     destination: &mut archive_fs::Destination,
     workers: usize,
     observer: &mut O,
@@ -984,15 +1122,15 @@ fn extract_batch<O: archive_core::progress::Observer>(
     reporter.stage(Stage::Decoding);
     let mut outputs = staging::BatchSpool::new(destination)?;
     let mut ids = Vec::new();
-    for entry in entries {
+    for (entry, path) in entries.iter().zip(paths) {
         check_cancelled()?;
         match entry.kind {
             EntryKind::Directory => {
-                destination.directory(&entry.raw_name)?;
-                outputs.directory_metadata(&entry.raw_name, archive.entry_metadata(entry.id)?);
+                destination.directory_validated(&path)?;
+                outputs.directory_metadata_validated(path, archive.entry_metadata(entry.id)?);
             }
             EntryKind::File => {
-                outputs.stage(entry.id.0, &entry.raw_name, entry.size)?;
+                outputs.stage_validated(entry.id.0, path, entry.size)?;
                 outputs.metadata(entry.id.0, archive.entry_metadata(entry.id)?)?;
                 ids.push(entry.id);
             }
@@ -1128,18 +1266,12 @@ fn package_operation(
         )
         .into());
     }
-    let limits = Limits {
-        max_input_bytes: cli.max_input_bytes,
-        max_entry_bytes: cli.max_entry_bytes,
-        max_total_bytes: cli.max_total_bytes,
-        max_entries: cli.max_entries,
-        ..Limits::default()
-    };
+    let limits = cli.limits();
     if let Some(result) = optical::operation(cli, path, limits)? {
         return Ok(Some(result));
     }
     if matches!(extension.as_str(), "wim" | "esd") {
-        let source = std::fs::File::open(path)?;
+        let source = CancellableSource(std::fs::File::open(path)?);
         if cli.image.is_none()
             && cli.image_name.is_none()
             && matches!(cli.command, Command::List { .. })
@@ -1235,7 +1367,7 @@ fn package_operation(
     }
     if matches!(extension.as_str(), "appxbundle" | "msixbundle") {
         let mut bundle = ms_package::AppxBundle::open(
-            std::fs::File::open(path)?,
+            CancellableSource(std::fs::File::open(path)?),
             package_compat::limits(limits),
             limits.max_metadata_bytes,
         )?;
@@ -1277,16 +1409,18 @@ fn package_operation(
     }
     if matches!(extension.as_str(), "appx" | "msix") {
         let mut package = ms_package::AppxPackage::open(
-            std::fs::File::open(path)?,
+            CancellableSource(std::fs::File::open(path)?),
             package_compat::limits(limits),
             limits.max_metadata_bytes,
         )?;
         return Ok(Some(appx_operation(cli, &mut package, &extension, limits)?));
     }
     if extension == "msi" {
-        let mut package = ms_package::InstallerPackage::open(
-            std::fs::File::open(path)?,
-            limits.max_entries as usize,
+        let mut package = ms_package::InstallerPackage::open_bounded(
+            CancellableSource(std::fs::File::open(path)?),
+            usize::try_from(limits.max_entries)
+                .map_err(|_| "MSI row limit exceeds platform range")?,
+            limits.max_input_bytes,
         )?;
         let files = package.files()?;
         let result = match &cli.command {
@@ -1300,7 +1434,7 @@ fn package_operation(
                 serde_json::json!({"schema_version":1,"ok":true,"operation":"list","format":"msi","entries":entries,"tables":package.tables(),"streams":package.streams()})
             }
             Command::Test { .. } | Command::Extract { .. } => {
-                preflight(files.iter().map(|f| f.path.as_bytes()))?;
+                let paths = preflight(files.iter().map(|f| f.path.as_bytes()))?;
                 let mut resolver = NativeMedia {
                     files: std::collections::BTreeMap::new(),
                     max_input: limits.max_input_bytes,
@@ -1331,7 +1465,7 @@ fn package_operation(
                     .as_ref()
                     .map(staging::BatchSpool::new)
                     .transpose()?;
-                for (id, file) in files.iter().enumerate() {
+                for (id, (file, path)) in files.iter().zip(paths).enumerate() {
                     check_cancelled()?;
                     if cli.verbose {
                         eprintln!("{}", file.path);
@@ -1344,7 +1478,7 @@ fn package_operation(
                         return Err("total decoded bytes limit exceeded".into());
                     }
                     if let Some(spool) = &mut pending {
-                        spool.stage(id, file.path.as_bytes(), bytes.len() as u64)?;
+                        spool.stage_validated(id, path, bytes.len() as u64)?;
                         spool.write(id, &bytes)?;
                     }
                 }
@@ -1392,26 +1526,26 @@ fn appx_operation<R: io::Read + io::Seek>(
             }
             package.validate(limits.max_total_bytes)?;
             let entries = package.entries().to_vec();
-            preflight(entries.iter().map(|e| e.raw_name.as_slice()))?;
+            let paths = preflight(entries.iter().map(|e| e.raw_name.as_slice()))?;
             std::fs::create_dir_all(output)?;
             let mut destination = archive_fs::Destination::open(output)?;
             let mut pending = staging::BatchSpool::new(&destination)?;
-            for entry in entries {
+            for (entry, path) in entries.into_iter().zip(paths) {
                 check_cancelled()?;
                 if cli.verbose {
                     eprintln!("{}", entry.name);
                 }
                 match entry.kind {
                     package_core::EntryKind::Directory => {
-                        destination.directory(&entry.raw_name)?;
-                        pending.directory_metadata(
-                            &entry.raw_name,
+                        destination.directory_validated(&path)?;
+                        pending.directory_metadata_validated(
+                            path,
                             package_compat::metadata(package.entry_metadata(entry.id)?),
                         );
                     }
                     package_core::EntryKind::File => {
                         let bytes = package.read_entry(entry.id, limits.max_entry_bytes)?;
-                        pending.stage(entry.id.0, &entry.raw_name, entry.size)?;
+                        pending.stage_validated(entry.id.0, path, entry.size)?;
                         pending.metadata(
                             entry.id.0,
                             package_compat::metadata(package.entry_metadata(entry.id)?),
@@ -1431,22 +1565,76 @@ fn appx_operation<R: io::Read + io::Seek>(
     }
 }
 
-fn preflight<'a>(names: impl Iterator<Item = &'a [u8]>) -> io::Result<()> {
+fn preflight<'a>(
+    names: impl Iterator<Item = &'a [u8]>,
+) -> io::Result<Vec<archive_fs::ValidatedPath>> {
     let mut seen = std::collections::BTreeSet::new();
-    for name in names {
-        if !seen.insert(archive_fs::validate_name(name)?.join("/").to_lowercase()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "duplicate destination path",
-            ));
-        }
-    }
-    Ok(())
+    names
+        .map(|name| {
+            let path = archive_fs::ValidatedPath::new(name)?;
+            if !seen.insert(path.collision_key().to_owned()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "duplicate destination path",
+                ));
+            }
+            Ok(path)
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod argument_tests {
     use super::*;
+
+    #[test]
+    fn native_memory_policy_respects_operation_and_explicit_caps() {
+        let cli = Cli::try_parse_from(["arc", "list", "archive.7z"]).unwrap();
+        let ram = 8u64 << 30;
+        let decoded = cli.limits_with_memory(Some(ram), archive_core::MemoryOperation::Decompress);
+        assert_eq!(decoded.max_active_workspace_bytes, ram / 32 * 17);
+        assert_eq!(
+            decoded.max_dictionary_bytes,
+            decoded.max_active_workspace_bytes
+        );
+        assert!(decoded.max_dictionary_bytes > 64 << 20);
+        let cli = Cli::try_parse_from([
+            "arc",
+            "--memuse",
+            "2g",
+            "--max-codec-workspace-bytes",
+            "1048576",
+            "--max-dictionary-bytes",
+            "32768",
+            "list",
+            "archive.7z",
+        ])
+        .unwrap();
+        let bounded = cli.limits_with_memory(Some(ram), archive_core::MemoryOperation::Decompress);
+        assert_eq!(bounded.max_active_workspace_bytes, 1 << 20);
+        assert_eq!(bounded.max_dictionary_bytes, 32768);
+        assert_eq!(bounded.max_input_bytes, cli.max_input_bytes);
+    }
+
+    #[test]
+    fn enumeration_keeps_only_descriptors_for_large_payloads() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::File::create(root.path().join("large"))
+            .unwrap()
+            .set_len(1 << 30)
+            .unwrap();
+        let mut entries = Vec::new();
+        enumerate(
+            root.path(),
+            root.path(),
+            &mut entries,
+            &mut 0,
+            &Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].size, 1 << 30);
+    }
 
     #[test]
     fn short_options_have_no_conflicts_and_parse_global_and_creation_values() {

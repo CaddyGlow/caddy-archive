@@ -34,9 +34,6 @@ jobs:
       - run: cargo test --workspace --all-features --locked
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --manifest-path fuzz/Cargo.toml --locked
-      - run: cargo fmt --manifest-path ../ms-package/Cargo.toml -- --check
-      - run: cargo test --manifest-path ../ms-package/Cargo.toml --all-features --locked
-      - run: cargo clippy --manifest-path ../ms-package/Cargo.toml --all-targets --all-features --locked -- -D warnings
 
   archive-features:
     runs-on: ubuntu-latest
@@ -86,11 +83,13 @@ jobs:
           node-version: '24'
       - run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
       - run: cargo build --release -p caddy-archive-wasm --features packages,crypto,sevenz,bzip2,brotli --target wasm32-unknown-unknown --locked
-      - name: Generate browser bindings and native parity fixtures
+      - name: Generate browser bindings and load preserved native parity fixtures
         shell: bash
         run: |
           wasm-bindgen target/wasm32-unknown-unknown/release/archive_wasm.wasm --target web --out-dir /tmp/archive-browser/pkg
-          cargo run --manifest-path ../ms-package/Cargo.toml --example browser_fixtures --locked -- /tmp/archive-browser/pkg/fixtures
+          (cd crates/archive-wasm/tests/fixtures/package && sha256sum --check SHA256SUMS)
+          mkdir -p /tmp/archive-browser/pkg/fixtures
+          cp crates/archive-wasm/tests/fixtures/package/* /tmp/archive-browser/pkg/fixtures/
       - name: Run real browser Worker regression checks
         shell: bash
         env:

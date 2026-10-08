@@ -34,6 +34,9 @@ permissions on a caller's filesystem.
 limits and reports sequential fallback. It does not split a single LZMA2
 decoder into workers. Observer APIs preserve these algorithms and report
 unknown physical/shared decode work as unknown.
+`extract_selected_cancellable` and `test_cancellable` check a caller-provided
+callback between decoded chunks; wrap input and output I/O to cancel opening,
+source reads, and creation as well.
 
 Output is provisional until the operation succeeds. `ExtractReport::verified`
 means expected size and available container checks passed, not authenticity;
@@ -45,6 +48,26 @@ TAR, gzip, zlib, LZMA, XZ, optional BZip2/Brotli and compressed TAR. `Sequential
 only, requiring each entry to be copied or skipped before advancing.
 Indexed compressed TAR buffers the decoded TAR under `max_buffered_bytes`
 (default 256 MiB), in addition to decoded output limits; raw compressed streams and forward creation avoid that full buffer.
+
+`create_from_readers` accepts `CreateSource` descriptors and opens one payload
+reader at a time for TAR, TAR.gz, TAR.xz, ZIP, 7z, and CAB, including encrypted
+ZIP and 7z.
+`create_stream_from_readers` supports the three TAR profiles without output
+seeking. Readers must produce exactly their declared size. These APIs avoid
+retaining all input payloads; the byte-based creation APIs remain available.
+7z writes each compressed payload directly to the seekable destination, then
+writes bounded archive metadata and patches its start header. Copy, DEFLATE,
+LZMA, LZMA2, optional BZip2/Brotli, AES payload encryption, and encrypted headers
+use this path. The writer keeps codec state and archive metadata, without a
+whole packed-archive buffer or payload scratch file. 7z output still requires
+`Write + Seek`; it is not a `create_stream_from_readers` format.
+CAB creation uses `ms-cabinet` 0.1.3 reader sources for stored, MSZIP, LZX,
+and Quantum folders. It opens one source at a time and uses a shared 32 KiB
+input frame; compression retains its codec state. Output requires `Write + Seek`.
+
+
+`Format::from_str` shares case-insensitive format aliases across callers;
+enabled features and operation-specific checks determine supported operations.
 
 The optional `crypto` feature exposes password opening and creation options.
 Creation requires a caller-provided cryptographically secure `RandomSource`;
@@ -97,7 +120,9 @@ Use `SequentialTar` for forward TAR processing without retaining the full TAR.
 compressed TAR; the CLI uses this path automatically. This spends bounded disk
 space instead of retaining the decoded TAR in RAM. The scratch file remains
 owned by the archive and is discarded on failure or drop when supplied as an
-anonymous temporary file. Auto-detection currently adds a decode pass.
+anonymous temporary file. Auto-detection inspects a bounded decoded prefix,
+continues the same decoder into the selected destination, and verifies the
+complete compressed stream before opening succeeds.
 
 `wim::FileWimArchive::open_reader` uses seekable input and emits one codec chunk
 at a time, verifying SHA-1 at completion. Range boundaries follow codec chunks
@@ -111,6 +136,29 @@ Thus this is not yet a no-whole-buffer guarantee for every API/format.
 Other defaults include 16 MiB metadata, 64 MiB dictionary, 256 MiB active
 workspace and 4 MiB pending parallel output. These are not additive guarantees
 of total heap use; dependency allocations and caller-owned input/output count too.
+
+`MemoryUsage::{Auto, Bytes, Percent}` parses a portable memory policy;
+`budget(physical_ram, MemoryOperation::{Compress, Decompress})` resolves it to
+bytes using RAM supplied by the caller. The core does not query the OS or
+implicitly change `Limits`. The automatic policy follows 7-Zip: creation uses
+80% of detected RAM, while decompression uses `RAM / 32 * 17` (approximately
+53.125%). The automatic RAM base is capped at 1.75 GiB on 32-bit targets.
+When RAM detection is unavailable, automatic budgets fall back to 2 GiB on
+64-bit targets or 1 GiB on 32-bit targets.
+Explicit values accept decimal bytes, binary `b/k/m/g/t` suffixes, and either
+`50%` or `p50` percentage notation, case-insensitively. Percentages refer to total
+RAM, not currently free RAM. These defaults and spellings follow 7-Zip 26.04's
+`CCommonMethodProps::InitCommon` and `ParseSizeString` in
+`CPP/7zip/Archive/Common/HandlerOut.{h,cpp}`.
+
+The native CLI applies that policy through `--memuse` (`--mmemuse` and
+`-mmemuse=VALUE` also work). It uses detected processor availability as its
+worker ceiling and reduces independent 7z folder concurrency to fit estimated
+aggregate workspace and pending-output budgets. `--max-codec-workspace-bytes`
+and `--max-dictionary-bytes` can impose tighter independent ceilings. CLI
+dictionaries otherwise share the resolved workspace ceiling; the portable
+`Limits` defaults and bounded browser configuration remain unchanged.
+These controls budget codec work and scheduling, not total process RSS.
 
 Output defaults (8 GiB per entry, 32 GiB total) accommodate large archives;
 choose smaller `Limits` for untrusted uploads. Absolute byte limits intentionally

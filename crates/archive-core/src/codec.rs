@@ -10,6 +10,7 @@ pub(crate) fn inflate(
 ) -> Result<u64> {
     inflate_window(reader, writer, if gzip { 31 } else { 0 }, limit, 1)
 }
+#[cfg(any(feature = "zip", feature = "gzip", feature = "streams"))]
 pub(crate) fn inflate_window(
     reader: &mut impl Read,
     writer: &mut impl Write,
@@ -17,69 +18,120 @@ pub(crate) fn inflate_window(
     limit: u64,
     max_members: u64,
 ) -> Result<u64> {
-    let mut decoder = Inflate::new(window != 0, if window == 0 { 15 } else { window });
-    let mut completed = 0u64;
-    let mut members = 1u64;
-    let mut input = [0u8; 65536];
-    let mut output = [0u8; 65536];
-    let mut start = 0;
-    let mut end = 0;
-    let mut eof = false;
+    let mut decoder = InflateReader::new(reader, window, limit, max_members);
+    let mut output = [0; 65536];
+    let mut total = 0;
     loop {
-        if start == end && !eof {
-            end = reader.read(&mut input)?;
-            start = 0;
-            eof = end == 0;
+        let count = decoder.read_inner(&mut output)?;
+        if count == 0 {
+            return Ok(total);
         }
-        let before_in = decoder.total_in();
-        let before_out = decoder.total_out();
-        let status = decoder
-            .decompress(&input[start..end], &mut output, InflateFlush::NoFlush)
-            .map_err(|e| Error::Integrity(e.as_str().into()))?;
-        start += usize::try_from(decoder.total_in() - before_in)
-            .map_err(|_| Error::ResourceLimit("input offset"))?;
-        let produced = usize::try_from(decoder.total_out() - before_out)
-            .map_err(|_| Error::ResourceLimit("output offset"))?;
-        if completed
-            .checked_add(decoder.total_out())
-            .is_none_or(|total| total > limit)
-        {
-            return Err(Error::ResourceLimit("decoded bytes"));
+        writer.write_all(&output[..count])?;
+        total += count as u64;
+    }
+}
+/// Incremental inflater; EOF verifies the checksum and rejects trailing data.
+pub(crate) struct InflateReader<R> {
+    source: R,
+    decoder: Inflate,
+    input: Box<[u8; 65536]>,
+    start: usize,
+    end: usize,
+    window: u8,
+    limit: u64,
+    max_members: u64,
+    members: u64,
+    completed: u64,
+    ended: bool,
+    finished: bool,
+}
+impl<R: Read> InflateReader<R> {
+    pub(crate) fn new(source: R, window: u8, limit: u64, max_members: u64) -> Self {
+        Self {
+            source,
+            decoder: Inflate::new(window != 0, if window == 0 { 15 } else { window }),
+            input: Box::new([0; 65536]),
+            start: 0,
+            end: 0,
+            window,
+            limit,
+            max_members,
+            members: 1,
+            completed: 0,
+            ended: false,
+            finished: false,
         }
-        writer.write_all(&output[..produced])?;
-        if status == Status::StreamEnd {
-            if start == end {
-                end = reader.read(&mut input)?;
-                start = 0;
-            }
-            if start == end {
-                return completed
-                    .checked_add(decoder.total_out())
-                    .ok_or(Error::ResourceLimit("decoded bytes"));
-            }
-            if window != 31 || max_members == 1 {
-                return Err(Error::Unsupported(
-                    "trailing or concatenated compressed streams".into(),
-                ));
-            }
-            completed = completed
-                .checked_add(decoder.total_out())
-                .ok_or(Error::ResourceLimit("decoded bytes"))?;
-            members += 1;
-            if members > max_members {
-                return Err(Error::ResourceLimit("gzip members"));
-            }
-            decoder = Inflate::new(true, 31);
-            continue;
+    }
+    fn read_inner(&mut self, output: &mut [u8]) -> Result<usize> {
+        if output.is_empty() || self.finished {
+            return Ok(0);
         }
-        if decoder.total_in() == before_in && produced == 0 {
-            return Err(Error::Integrity("truncated compressed stream".into()));
+        loop {
+            if self.start == self.end {
+                self.end = self.source.read(&mut self.input[..])?;
+                self.start = 0;
+            }
+            if self.ended {
+                if self.start == self.end {
+                    self.finished = true;
+                    return Ok(0);
+                }
+                if self.window != 31 || self.max_members == 1 {
+                    return Err(Error::Unsupported(
+                        "trailing or concatenated compressed streams".into(),
+                    ));
+                }
+                self.members += 1;
+                if self.members > self.max_members {
+                    return Err(Error::ResourceLimit("gzip members"));
+                }
+                self.completed = self
+                    .completed
+                    .checked_add(self.decoder.total_out())
+                    .ok_or(Error::ResourceLimit("decoded bytes"))?;
+                self.decoder = Inflate::new(true, 31);
+                self.ended = false;
+            }
+            let before_in = self.decoder.total_in();
+            let before_out = self.decoder.total_out();
+            let status = self
+                .decoder
+                .decompress(
+                    &self.input[self.start..self.end],
+                    output,
+                    InflateFlush::NoFlush,
+                )
+                .map_err(|e| Error::Integrity(e.as_str().into()))?;
+            self.start += (self.decoder.total_in() - before_in) as usize;
+            let produced = (self.decoder.total_out() - before_out) as usize;
+            if self
+                .completed
+                .checked_add(self.decoder.total_out())
+                .is_none_or(|total| total > self.limit)
+            {
+                return Err(Error::ResourceLimit("decoded bytes"));
+            }
+            self.ended = status == Status::StreamEnd;
+            if produced != 0 {
+                return Ok(produced);
+            }
+            if !self.ended && self.decoder.total_in() == before_in {
+                return Err(Error::Integrity("truncated compressed stream".into()));
+            }
         }
     }
 }
+impl<R: Read> Read for InflateReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        self.read_inner(output).map_err(std::io::Error::other)
+    }
+}
+
+#[cfg(any(feature = "gzip", feature = "streams", all(test, feature = "zip")))]
 pub(crate) fn deflate(data: &[u8], writer: &mut impl Write, gzip: bool) -> Result<()> {
     deflate_window(data, writer, if gzip { 31 } else { -15 })
 }
+#[cfg(any(feature = "gzip", feature = "streams", all(test, feature = "zip")))]
 pub(crate) fn deflate_window(data: &[u8], writer: &mut impl Write, window: i32) -> Result<()> {
     let mut decoder = Deflate::new_with_config(DeflateConfig {
         window_bits: window,
@@ -106,12 +158,22 @@ pub(crate) fn deflate_window(data: &[u8], writer: &mut impl Write, window: i32) 
         }
     }
 }
-#[cfg(any(feature = "gzip", feature = "streams"))]
+#[cfg(any(
+    feature = "gzip",
+    feature = "streams",
+    feature = "zip",
+    feature = "sevenz"
+))]
 pub(crate) struct DeflateWriter<W> {
     writer: W,
     encoder: Deflate,
 }
-#[cfg(any(feature = "gzip", feature = "streams"))]
+#[cfg(any(
+    feature = "gzip",
+    feature = "streams",
+    feature = "zip",
+    feature = "sevenz"
+))]
 impl<W: Write> DeflateWriter<W> {
     pub(crate) fn new(writer: W, window: i32) -> Self {
         Self {
@@ -141,7 +203,12 @@ impl<W: Write> DeflateWriter<W> {
         }
     }
 }
-#[cfg(any(feature = "gzip", feature = "streams"))]
+#[cfg(any(
+    feature = "gzip",
+    feature = "streams",
+    feature = "zip",
+    feature = "sevenz"
+))]
 impl<W: Write> Write for DeflateWriter<W> {
     fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
         let mut remaining = input;

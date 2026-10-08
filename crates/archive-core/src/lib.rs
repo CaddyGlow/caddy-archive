@@ -2,6 +2,13 @@
 /// Version of this library, as declared in `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+#[cfg(feature = "cab")]
+mod cab_backend;
+#[cfg(any(feature = "xz", feature = "gzip", feature = "streams"))]
+mod compressed;
+mod format;
+mod memory;
+pub use memory::{MemoryOperation, MemoryUsage};
 pub mod incremental;
 pub mod progress;
 #[path = "io.rs"]
@@ -310,42 +317,24 @@ pub fn capabilities(format: Format) -> Capabilities {
         browser: enabled && format != Format::Wim,
     }
 }
-#[cfg(any(feature = "xz", feature = "gzip", feature = "streams"))]
-#[derive(Default)]
-struct Prefix {
-    bytes: Vec<u8>,
-}
-#[cfg(any(feature = "xz", feature = "gzip", feature = "streams"))]
-impl Write for Prefix {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let n = (512 - self.bytes.len()).min(bytes.len());
-        self.bytes.extend_from_slice(&bytes[..n]);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
 enum Backend<R> {
     #[cfg(feature = "zip")]
     Zip(R, Vec<zip_backend::Location>),
     #[cfg(feature = "tar")]
     Tar(R, Vec<u64>),
-    #[cfg(feature = "gzip")]
-    TarGzip(Vec<u8>, Vec<u64>),
-    #[cfg(all(feature = "streams", feature = "tar"))]
+    #[cfg(any(
+        feature = "gzip",
+        feature = "xz",
+        all(feature = "streams", feature = "tar")
+    ))]
     CompressedTar(Vec<u8>, Vec<u64>),
     #[cfg(feature = "cab")]
     Cab(cabinet::Cabinet<R>),
     #[cfg(feature = "iso")]
     Iso(R, Vec<Vec<libmkiso::iso9660::Extent>>),
-    #[cfg(feature = "xz")]
-    Xz(R),
-    #[cfg(feature = "xz")]
-    TarXz(Vec<u8>, Vec<u64>),
     #[cfg(feature = "sevenz")]
     SevenZip(Box<sevenz_backend::SevenZip<R>>),
-    #[cfg(any(feature = "gzip", feature = "streams"))]
+    #[cfg(any(feature = "xz", feature = "gzip", feature = "streams"))]
     Stream(R, Format),
     #[allow(dead_code)]
     Unavailable(std::marker::PhantomData<R>),
@@ -377,6 +366,18 @@ impl<R: Read + Seek> Archive<R> {
     where
         R: Write,
     {
+        if let Some(password) = password {
+            if password.len() > 1 << 20 {
+                return Err(Error::ResourceLimit("password bytes"));
+            }
+            if requested.is_some() {
+                return Err(Error::Unsupported(
+                    "explicit interpretation with password".into(),
+                ));
+            }
+            #[cfg(not(feature = "crypto"))]
+            return Err(Error::Unsupported("crypto feature unavailable".into()));
+        }
         if scratch.seek(SeekFrom::End(0))? != 0 {
             return Err(Error::Malformed("scratch storage must be empty".into()));
         }
@@ -396,77 +397,59 @@ impl<R: Read + Seek> Archive<R> {
             feature = "xz",
             all(feature = "streams", feature = "tar")
         ))]
-        {
-            let tar_format = match format {
-                #[cfg(feature = "gzip")]
-                Some(Format::Gzip | Format::TarGzip) => Some(Format::TarGzip),
-                #[cfg(feature = "xz")]
-                Some(Format::Xz | Format::TarXz) => Some(Format::TarXz),
-                #[cfg(all(feature = "streams", feature = "tar"))]
-                Some(Format::Bzip2 | Format::TarBzip2) => Some(Format::TarBzip2),
-                #[cfg(all(feature = "streams", feature = "tar"))]
-                Some(Format::TarBrotli) => Some(Format::TarBrotli),
-                _ => None,
+        if let Some(profile) = format.and_then(|format| compressed::profile(format, requested)) {
+            #[cfg(any(feature = "gzip", feature = "streams"))]
+            let gzip_header = if profile.raw == Format::Gzip {
+                Some(stream_backend::gzip_header(&mut reader, limits)?)
+            } else {
+                None
             };
-            if let Some(tar_format) = tar_format {
-                let explicit_tar = requested == Some(tar_format);
-                if explicit_tar || requested.is_none() {
-                    fn decode<R: Read + Seek>(
-                        reader: &mut R,
-                        writer: &mut impl Write,
-                        format: Format,
-                        limits: Limits,
-                    ) -> Result<u64> {
-                        match format {
-                            #[cfg(feature = "xz")]
-                            Format::TarXz => xz_backend::decode(reader, writer, limits),
-                            #[cfg(feature = "gzip")]
-                            Format::TarGzip => {
-                                stream_backend::decode(reader, writer, Format::Gzip, limits)
-                            }
-                            #[cfg(all(feature = "streams", feature = "tar"))]
-                            Format::TarBzip2 => {
-                                stream_backend::decode(reader, writer, Format::Bzip2, limits)
-                            }
-                            #[cfg(all(feature = "streams", feature = "tar"))]
-                            Format::TarBrotli => {
-                                stream_backend::decode(reader, writer, Format::Brotli, limits)
-                            }
-                            _ => Err(Error::Unsupported("compressed TAR codec".into())),
-                        }
-                    }
-                    let mut prefix = Prefix::default();
-                    if explicit_tar || {
-                        decode(&mut reader, &mut prefix, tar_format, limits)?;
-                        probe(&prefix.bytes).ok() == Some(Format::Tar)
-                    } {
-                        if password.is_some() {
-                            return Err(Error::Unsupported("compressed TAR encryption".into()));
-                        }
-                        let decoded = decode(&mut reader, &mut scratch, tar_format, limits)?;
-                        scratch.flush()?;
-                        scratch.rewind()?;
-                        let mut archive = Self::open_inner(
-                            scratch,
-                            Limits {
-                                max_input_bytes: decoded,
-                                ..limits
-                            },
-                            None,
-                            Some(Format::Tar),
-                        )?;
-                        archive.limits = limits;
-                        archive.format = tar_format;
-                        archive.detected_format = detected;
-                        #[cfg(any(feature = "gzip", feature = "streams"))]
-                        if tar_format == Format::TarGzip {
-                            archive.gzip_header =
-                                Some(stream_backend::gzip_header(&mut reader, limits)?);
-                        }
-                        return Ok(archive);
-                    }
+            let (decoded, is_tar) = profile.decode(&mut reader, &mut scratch, limits)?;
+            if is_tar {
+                if password.is_some() {
+                    return Err(Error::Unsupported("compressed TAR encryption".into()));
                 }
+                scratch.flush()?;
+                scratch.rewind()?;
+                let mut archive = Self::open_inner(
+                    scratch,
+                    Limits {
+                        max_input_bytes: decoded,
+                        ..limits
+                    },
+                    None,
+                    Some(Format::Tar),
+                )?;
+                archive.limits = limits;
+                archive.format = profile
+                    .tar
+                    .ok_or_else(|| Error::Unsupported("compressed TAR backend".into()))?;
+                archive.detected_format = detected;
+                #[cfg(any(feature = "gzip", feature = "streams"))]
+                {
+                    archive.gzip_header = gzip_header;
+                }
+                return Ok(archive);
             }
+            let name = None;
+            #[cfg(any(feature = "gzip", feature = "streams"))]
+            let name = gzip_header
+                .as_ref()
+                .map(|header| header.original_name.as_slice())
+                .or(name);
+            let entries = vec![compressed::entry(profile.raw, decoded, length, name)];
+            validate_index(&entries, limits)?;
+            return Ok(Self {
+                backend: Backend::Stream(reader, profile.raw),
+                entries,
+                limits,
+                format: profile.raw,
+                detected_format: detected,
+                #[cfg(any(feature = "gzip", feature = "streams"))]
+                gzip_header,
+                #[cfg(feature = "crypto")]
+                password: None,
+            });
         }
         let _ = format;
         if let Some(password) = password {
@@ -537,165 +520,48 @@ impl<R: Read + Seek> Archive<R> {
                 let (e, l) = iso_backend::index(&mut reader, limits)?;
                 (Backend::Iso(reader, l), e)
             }
-            #[cfg(any(feature = "gzip", feature = "streams"))]
-            Format::Gzip | Format::TarGzip => {
-                let header = stream_backend::gzip_header(&mut reader, limits)?;
-                let mut prefix = Prefix::default();
-                let size = stream_backend::decode(&mut reader, &mut prefix, Format::Gzip, limits)?;
-                gzip_header = Some(header.clone());
-                #[cfg(feature = "gzip")]
-                if requested != Some(Format::Gzip)
-                    && (requested == Some(Format::TarGzip)
-                        || probe(&prefix.bytes).ok() == Some(Format::Tar))
-                {
-                    let mut bytes = crate::range::BoundedBuffer::new(limits.max_buffered_bytes);
-                    stream_backend::decode(&mut reader, &mut bytes, Format::Gzip, limits)?;
-                    let bytes = bytes.into_inner();
-                    let (e, l) = tar_backend::index(&mut io::Cursor::new(&bytes), limits)?;
-                    format = Format::TarGzip;
-                    validate_index(&e, limits)?;
+            #[cfg(any(feature = "xz", feature = "gzip", feature = "streams"))]
+            selected if compressed::profile(selected, requested).is_some() => {
+                let profile = compressed::profile(selected, requested)
+                    .ok_or_else(|| Error::Unsupported("compressed stream codec".into()))?;
+                #[cfg(any(feature = "gzip", feature = "streams"))]
+                if profile.raw == Format::Gzip {
+                    gzip_header = Some(stream_backend::gzip_header(&mut reader, limits)?);
+                }
+                let mut decoded = crate::range::BoundedBuffer::new(limits.max_buffered_bytes);
+                let (size, is_tar) = profile.decode(&mut reader, &mut decoded, limits)?;
+                #[cfg(feature = "tar")]
+                if is_tar {
+                    let bytes = decoded.into_inner();
+                    let (entries, locations) =
+                        tar_backend::index(&mut io::Cursor::new(&bytes), limits)?;
+                    validate_index(&entries, limits)?;
                     return Ok(Self {
-                        backend: Backend::TarGzip(bytes, l),
-                        entries: e,
+                        backend: Backend::CompressedTar(bytes, locations),
+                        entries,
                         limits,
-                        format,
+                        format: profile
+                            .tar
+                            .ok_or_else(|| Error::Unsupported("compressed TAR backend".into()))?,
                         detected_format,
+                        #[cfg(any(feature = "gzip", feature = "streams"))]
                         gzip_header,
                         #[cfg(feature = "crypto")]
                         password: None,
                     });
                 }
-                format = Format::Gzip;
-                let name = if header.original_name.is_empty() {
-                    b"data".to_vec()
-                } else {
-                    header.original_name
-                };
+                let _ = is_tar;
+                format = profile.raw;
+                let name = None;
+                #[cfg(any(feature = "gzip", feature = "streams"))]
+                let name = gzip_header
+                    .as_ref()
+                    .map(|header| header.original_name.as_slice())
+                    .or(name);
                 (
-                    Backend::Stream(reader, Format::Gzip),
-                    vec![Entry {
-                        id: EntryId(0),
-                        name: String::from_utf8_lossy(&name).into_owned(),
-                        raw_name: name,
-                        kind: EntryKind::File,
-                        size,
-                        compressed_size: Some(length),
-                        compression: "DEFLATE".into(),
-                        encrypted: false,
-                    }],
+                    Backend::Stream(reader, format),
+                    vec![compressed::entry(format, size, length, name)],
                 )
-            }
-            #[cfg(feature = "streams")]
-            Format::Zlib
-            | Format::Lzma
-            | Format::Deflate
-            | Format::Bzip2
-            | Format::Brotli
-            | Format::TarBzip2
-            | Format::TarBrotli => {
-                #[cfg(feature = "tar")]
-                {
-                    let mut detected_size = None;
-                    let detected_tar = if requested.is_none() && format == Format::Bzip2 {
-                        let mut prefix = Prefix::default();
-                        detected_size = Some(stream_backend::decode(
-                            &mut reader,
-                            &mut prefix,
-                            format,
-                            limits,
-                        )?);
-                        probe(&prefix.bytes).ok() == Some(Format::Tar)
-                    } else {
-                        false
-                    };
-                    if detected_tar || matches!(format, Format::TarBzip2 | Format::TarBrotli) {
-                        if detected_tar {
-                            format = Format::TarBzip2;
-                        }
-                        let raw = if format == Format::TarBzip2 {
-                            Format::Bzip2
-                        } else {
-                            Format::Brotli
-                        };
-                        let mut bytes = crate::range::BoundedBuffer::new(limits.max_buffered_bytes);
-                        stream_backend::decode(&mut reader, &mut bytes, raw, limits)?;
-                        let bytes = bytes.into_inner();
-                        let (entries, locations) =
-                            tar_backend::index(&mut io::Cursor::new(&bytes), limits)?;
-                        (Backend::CompressedTar(bytes, locations), entries)
-                    } else {
-                        let size = match detected_size {
-                            Some(size) => size,
-                            None => stream_backend::decode(
-                                &mut reader,
-                                &mut io::sink(),
-                                format,
-                                limits,
-                            )?,
-                        };
-                        (
-                            Backend::Stream(reader, format),
-                            vec![Entry {
-                                id: EntryId(0),
-                                name: "data".into(),
-                                raw_name: b"data".to_vec(),
-                                kind: EntryKind::File,
-                                size,
-                                compressed_size: Some(length),
-                                compression: format!("{format:?}"),
-                                encrypted: false,
-                            }],
-                        )
-                    }
-                }
-                #[cfg(not(feature = "tar"))]
-                {
-                    let size =
-                        stream_backend::decode(&mut reader, &mut io::sink(), format, limits)?;
-                    (
-                        Backend::Stream(reader, format),
-                        vec![Entry {
-                            id: EntryId(0),
-                            name: "data".into(),
-                            raw_name: b"data".to_vec(),
-                            kind: EntryKind::File,
-                            size,
-                            compressed_size: Some(length),
-                            compression: format!("{format:?}"),
-                            encrypted: false,
-                        }],
-                    )
-                }
-            }
-            #[cfg(feature = "xz")]
-            Format::Xz | Format::TarXz => {
-                let mut prefix = Prefix::default();
-                let size = xz_backend::decode(&mut reader, &mut prefix, limits)?;
-                if requested != Some(Format::Xz)
-                    && (requested == Some(Format::TarXz)
-                        || probe(&prefix.bytes).ok() == Some(Format::Tar))
-                {
-                    let mut decoded = crate::range::BoundedBuffer::new(limits.max_buffered_bytes);
-                    xz_backend::decode(&mut reader, &mut decoded, limits)?;
-                    let decoded = decoded.into_inner();
-                    let (e, l) = tar_backend::index(&mut io::Cursor::new(&decoded), limits)?;
-                    format = Format::TarXz;
-                    (Backend::TarXz(decoded, l), e)
-                } else {
-                    (
-                        Backend::Xz(reader),
-                        vec![Entry {
-                            id: EntryId(0),
-                            name: "data".into(),
-                            raw_name: b"data".to_vec(),
-                            kind: EntryKind::File,
-                            size,
-                            compressed_size: Some(length),
-                            compression: "LZMA2".into(),
-                            encrypted: false,
-                        }],
-                    )
-                }
             }
             #[cfg(feature = "sevenz")]
             Format::SevenZip => {
@@ -824,15 +690,12 @@ impl<R: Read + Seek> Archive<R> {
             Backend::Zip(_, locations) => Ok(locations[id.0].metadata.clone()),
             #[cfg(feature = "tar")]
             Backend::Tar(reader, locations) => tar_backend::metadata(reader, locations[id.0]),
-            #[cfg(feature = "gzip")]
-            Backend::TarGzip(data, locations) => {
-                tar_backend::metadata(&mut io::Cursor::new(data), locations[id.0])
-            }
-            #[cfg(feature = "xz")]
-            Backend::TarXz(data, locations) => {
-                tar_backend::metadata(&mut io::Cursor::new(data), locations[id.0])
-            }
-            #[cfg(all(feature = "streams", feature = "tar"))]
+
+            #[cfg(any(
+                feature = "gzip",
+                feature = "xz",
+                all(feature = "streams", feature = "tar")
+            ))]
             Backend::CompressedTar(data, locations) => {
                 tar_backend::metadata(&mut io::Cursor::new(data), locations[id.0])
             }
@@ -845,6 +708,18 @@ impl<R: Read + Seek> Archive<R> {
         ids: &[EntryId],
         sink: &mut impl FnMut(EntryId, &[u8]) -> Result<()>,
     ) -> Result<ExtractReport> {
+        self.extract_selected_cancellable(ids, || false, sink)
+    }
+    /// Extract selected entries while checking cancellation during decoded work.
+    pub fn extract_selected_cancellable(
+        &mut self,
+        ids: &[EntryId],
+        cancelled: impl Fn() -> bool,
+        sink: &mut impl FnMut(EntryId, &[u8]) -> Result<()>,
+    ) -> Result<ExtractReport> {
+        if cancelled() {
+            return Err(Error::Cancelled);
+        }
         let mut selected = std::collections::BTreeSet::new();
         let mut total = 0u64;
         for id in ids {
@@ -864,15 +739,24 @@ impl<R: Read + Seek> Archive<R> {
         }
         #[cfg(feature = "sevenz")]
         if let Backend::SevenZip(backend) = &mut self.backend {
-            return sevenz_backend::extract_selected(backend, ids, sink);
+            return sevenz_backend::extract_selected_cancellable(backend, ids, &cancelled, sink);
         }
         let mut report = ExtractReport {
             verified: true,
             ..Default::default()
         };
         for id in ids {
+            if cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let mut cancellable_sink = |id, bytes: &[u8]| {
+                if cancelled() {
+                    return Err(Error::Cancelled);
+                }
+                sink(id, bytes)
+            };
             let mut writer = FnWriter {
-                sink,
+                sink: &mut cancellable_sink,
                 id: *id,
                 error: None,
             };
@@ -917,12 +801,7 @@ impl<R: Read + Seek> Archive<R> {
                 sink,
             );
         }
-        let report = self.extract_selected(ids, &mut |id, bytes| {
-            if cancelled() {
-                return Err(Error::Cancelled);
-            }
-            sink(id, bytes)
-        })?;
+        let report = self.extract_selected_cancellable(ids, cancelled, sink)?;
         Ok(BatchReport {
             decoded_bytes: report.bytes,
             report,
@@ -976,13 +855,12 @@ impl<R: Read + Seek> Archive<R> {
                 reader.seek(SeekFrom::Start(loc[id.0]))?;
                 copy_bounded(&mut reader.take(entry.size), output, limit)?
             }
-            #[cfg(feature = "gzip")]
-            Backend::TarGzip(data, loc) => {
-                let mut reader = io::Cursor::new(data);
-                reader.seek(SeekFrom::Start(loc[id.0]))?;
-                copy_bounded(&mut reader.take(entry.size), output, limit)?
-            }
-            #[cfg(all(feature = "streams", feature = "tar"))]
+
+            #[cfg(any(
+                feature = "gzip",
+                feature = "xz",
+                all(feature = "streams", feature = "tar")
+            ))]
             Backend::CompressedTar(data, loc) => {
                 let mut reader = io::Cursor::new(data);
                 reader.seek(SeekFrom::Start(loc[id.0]))?;
@@ -1003,17 +881,10 @@ impl<R: Read + Seek> Archive<R> {
                 }
                 bytes
             }
-            #[cfg(feature = "xz")]
-            Backend::Xz(reader) => xz_backend::decode(reader, output, self.limits)?,
-            #[cfg(feature = "xz")]
-            Backend::TarXz(data, loc) => {
-                let mut reader = io::Cursor::new(data);
-                reader.seek(SeekFrom::Start(loc[id.0]))?;
-                copy_bounded(&mut reader.take(entry.size), output, limit)?
-            }
-            #[cfg(any(feature = "gzip", feature = "streams"))]
+
+            #[cfg(any(feature = "xz", feature = "gzip", feature = "streams"))]
             Backend::Stream(reader, format) => {
-                stream_backend::decode(reader, output, *format, self.limits)?
+                compressed::decode_raw(reader, output, *format, self.limits)?
             }
             #[cfg(feature = "sevenz")]
             Backend::SevenZip(backend) => sevenz_backend::extract(backend, id, output)?,
@@ -1092,6 +963,14 @@ impl<R: Read + Seek> Archive<R> {
         &mut self,
         observer: &mut O,
     ) -> Result<ExtractReport> {
+        self.test_observed_cancellable(observer, || false)
+    }
+    /// Verify with progress and cancellation, including buffered archive payloads.
+    pub fn test_observed_cancellable<O: progress::Observer>(
+        &mut self,
+        observer: &mut O,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<ExtractReport> {
         let selected = self
             .entries
             .iter()
@@ -1099,7 +978,7 @@ impl<R: Read + Seek> Archive<R> {
         let mut reporter = progress::Reporter::new(observer, selected);
         reporter.stage(progress::Stage::Verifying);
         let ids: Vec<_> = self.entries.iter().map(|entry| entry.id).collect();
-        let report = match self.extract_selected(&ids, &mut |_, _| Ok(())) {
+        let report = match self.extract_selected_cancellable(&ids, cancelled, &mut |_, _| Ok(())) {
             Ok(report) => report,
             Err(error) => {
                 reporter.finish(if matches!(error, Error::Cancelled) {
@@ -1119,8 +998,12 @@ impl<R: Read + Seek> Archive<R> {
     }
 
     pub fn test(&mut self) -> Result<ExtractReport> {
+        self.test_cancellable(|| false)
+    }
+    /// Verify every entry with cancellation checked between decoded chunks.
+    pub fn test_cancellable(&mut self, cancelled: impl Fn() -> bool) -> Result<ExtractReport> {
         let ids: Vec<_> = self.entries.iter().map(|entry| entry.id).collect();
-        self.extract_selected(&ids, &mut |_, _| Ok(()))
+        self.extract_selected_cancellable(&ids, cancelled, &mut |_, _| Ok(()))
     }
 }
 /// Inflate raw DEFLATE, zlib or gzip from forward-only input into provisional output.
@@ -1207,6 +1090,154 @@ pub fn probe(bytes: &[u8]) -> Result<Format> {
         Err(Error::Unsupported("unrecognized archive signature".into()))
     }
 }
+/// Metadata for an entry whose payload is opened on demand.
+#[derive(Debug, Clone)]
+pub struct CreateSource {
+    pub name: String,
+    pub kind: EntryKind,
+    pub size: u64,
+}
+#[cfg(any(feature = "tar", feature = "zip", feature = "sevenz", feature = "cab"))]
+trait CreationEntry {
+    fn source_name(&self) -> &str;
+    fn source_kind(&self) -> EntryKind;
+    fn source_size(&self) -> u64;
+}
+#[cfg(any(feature = "tar", feature = "zip", feature = "sevenz", feature = "cab"))]
+impl CreationEntry for CreateSource {
+    fn source_name(&self) -> &str {
+        &self.name
+    }
+    fn source_kind(&self) -> EntryKind {
+        self.kind
+    }
+    fn source_size(&self) -> u64 {
+        self.size
+    }
+}
+#[cfg(any(feature = "tar", feature = "zip", feature = "sevenz", feature = "cab"))]
+impl CreationEntry for CreateEntry {
+    fn source_name(&self) -> &str {
+        &self.name
+    }
+    fn source_kind(&self) -> EntryKind {
+        self.kind
+    }
+    fn source_size(&self) -> u64 {
+        self.data.len() as u64
+    }
+}
+/// Create an archive while opening only the current entry's reader.
+/// Readers must yield exactly the advertised size; changed/truncated sources fail.
+pub fn create_from_readers<'a>(
+    format: Format,
+    entries: &[CreateSource],
+    open: &mut impl FnMut(usize) -> Result<Box<dyn Read + 'a>>,
+    writer: &mut (impl Write + Seek),
+    limits: Limits,
+    mut options: CreateOptions<'_>,
+) -> Result<()> {
+    validate_create_options(format, &options, limits)?;
+    validate_creation(
+        entries.iter().map(|e| (e.name.as_str(), e.kind, e.size)),
+        limits,
+    )?;
+    if options
+        .entry_metadata
+        .is_some_and(|m| m.len() != entries.len())
+    {
+        return Err(Error::Malformed("creation metadata count mismatch".into()));
+    }
+    #[cfg(feature = "cab")]
+    if format == Format::Cab {
+        return cab_backend::create_readers(entries, open, writer, limits, &options);
+    }
+    #[cfg(feature = "sevenz")]
+    if format == Format::SevenZip {
+        return sevenz_backend::create_readers(entries, open, writer, &mut options, limits);
+    }
+    #[cfg(feature = "zip")]
+    if format == Format::Zip {
+        if options.zip_compression == ZipCompression::Deflate {
+            check_deflate_encoder(limits)?;
+        }
+        if options.encrypt_headers {
+            return Err(Error::Unsupported("ZIP filename encryption".into()));
+        }
+        let encryption = match options.password {
+            Some(password) => Some((
+                password,
+                options.randomness.take().ok_or_else(|| {
+                    Error::Unsupported("encrypted creation requires secure randomness".into())
+                })?,
+            )),
+            None => None,
+        };
+        return zip_backend::create_readers(
+            entries,
+            open,
+            writer,
+            encryption,
+            options.zip_encryption,
+            options.entry_metadata,
+            options.zip_compression,
+        );
+    }
+    let _ = &mut options;
+    if options.password.is_some() {
+        return Err(Error::Unsupported(
+            "encrypted creation for this format".into(),
+        ));
+    }
+    create_stream_from_readers(
+        format,
+        entries,
+        open,
+        writer,
+        limits,
+        options.entry_metadata,
+    )
+}
+/// Create a TAR-family archive from readers without requiring output seeking.
+pub fn create_stream_from_readers<'a>(
+    format: Format,
+    entries: &[CreateSource],
+    open: &mut impl FnMut(usize) -> Result<Box<dyn Read + 'a>>,
+    writer: &mut impl Write,
+    limits: Limits,
+    metadata: Option<&[EntryMetadata]>,
+) -> Result<()> {
+    validate_creation(
+        entries.iter().map(|e| (e.name.as_str(), e.kind, e.size)),
+        limits,
+    )?;
+    if metadata.is_some_and(|m| m.len() != entries.len()) {
+        return Err(Error::Malformed("creation metadata count mismatch".into()));
+    }
+    let _ = (&open, &writer, metadata);
+    match format {
+        #[cfg(feature = "tar")]
+        Format::Tar => tar_backend::create_readers(entries, open, writer, metadata),
+        #[cfg(feature = "gzip")]
+        Format::TarGzip => {
+            check_deflate_encoder(limits)?;
+            let mut compressor = codec::DeflateWriter::new(writer, 31);
+            tar_backend::create_readers(entries, open, &mut compressor, metadata)?;
+            compressor.finish()?;
+            Ok(())
+        }
+        #[cfg(feature = "xz")]
+        Format::TarXz => {
+            let mut compressor = xz_backend::XzWriter::new(writer, limits, None)?;
+            tar_backend::create_readers(entries, open, &mut compressor, metadata)?;
+            compressor.finish()
+        }
+        _ => Err(Error::Unsupported(format!(
+            "reader-based creation of {format:?}"
+        ))),
+    }
+}
+
 pub fn create<W: Write + Seek>(
     format: Format,
     entries: &[CreateEntry],
@@ -1216,26 +1247,16 @@ pub fn create<W: Write + Seek>(
     if matches!(
         format,
         Format::Zip | Format::Cab | Format::TarGzip | Format::Gzip | Format::Zlib
-    ) && (limits.max_dictionary_bytes < 32768 || limits.max_active_workspace_bytes < 1 << 20)
-    {
-        return Err(Error::ResourceLimit("DEFLATE encoder workspace bytes"));
+    ) {
+        check_deflate_encoder(limits)?;
     }
     let _ = &writer;
-    let metadata: Vec<_> = entries
-        .iter()
-        .enumerate()
-        .map(|(i, e)| Entry {
-            id: EntryId(i),
-            raw_name: e.name.as_bytes().to_vec(),
-            name: e.name.clone(),
-            kind: e.kind,
-            size: e.data.len() as u64,
-            compressed_size: None,
-            compression: String::new(),
-            encrypted: false,
-        })
-        .collect();
-    validate_index(&metadata, limits)?;
+    validate_creation(
+        entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.kind, e.data.len() as u64)),
+        limits,
+    )?;
     match format {
         #[cfg(feature = "zip")]
         Format::Zip => zip_backend::create(entries, writer),
@@ -1259,7 +1280,9 @@ pub fn create<W: Write + Seek>(
             xz_backend::encode(&entries[0].data, writer, limits)
         }
         #[cfg(feature = "sevenz")]
-        Format::SevenZip => sevenz_backend::create(entries, writer, &mut CreateOptions::default()),
+        Format::SevenZip => {
+            sevenz_backend::create(entries, writer, &mut CreateOptions::default(), limits)
+        }
         #[cfg(any(feature = "gzip", feature = "streams"))]
         Format::Gzip => {
             if entries.len() != 1 || entries[0].kind != EntryKind::File {
@@ -1277,17 +1300,13 @@ pub fn create<W: Write + Seek>(
             stream_backend::encode(&entries[0].data, writer, format, limits)
         }
         #[cfg(feature = "cab")]
-        Format::Cab => {
-            let mut builder = cabinet::CabinetBuilder::new(cabinet::WriteCompression::MsZip);
-            for e in entries {
-                if e.kind != EntryKind::File {
-                    return Err(Error::Unsupported("CAB directories and links".into()));
-                }
-                builder.add_file(&e.name, &e.data)?;
-            }
-            builder.write(writer)?;
-            Ok(())
-        }
+        Format::Cab => cab_backend::create_readers(
+            entries,
+            &mut |index| Ok(Box::new(io::Cursor::new(entries[index].data.as_slice()))),
+            writer,
+            limits,
+            &CreateOptions::default(),
+        ),
         _ => Err(Error::Unsupported(format!("creation of {format:?}"))),
     }
 }
@@ -1321,51 +1340,16 @@ fn create_stream_inner(
     metadata_values: Option<&[EntryMetadata]>,
 ) -> Result<()> {
     let _ = metadata_values;
-    if matches!(format, Format::TarGzip | Format::Gzip | Format::Zlib)
-        && (limits.max_dictionary_bytes < 32768 || limits.max_active_workspace_bytes < 1 << 20)
-    {
-        return Err(Error::ResourceLimit("DEFLATE encoder workspace bytes"));
+    if matches!(format, Format::TarGzip | Format::Gzip | Format::Zlib) {
+        check_deflate_encoder(limits)?;
     }
     let _ = &writer;
-    let mut total = 0u64;
-    let mut metadata = 0u64;
-    if entries.len() as u64 > limits.max_entries {
-        return Err(Error::ResourceLimit("entries"));
-    }
-    for entry in entries {
-        if entry.kind == EntryKind::Directory && !entry.data.is_empty() {
-            return Err(Error::Malformed(
-                "directory entry has a nonzero payload size".into(),
-            ));
-        }
-        if entry
-            .name
-            .as_bytes()
-            .split(|byte| matches!(byte, b'/' | b'\\'))
-            .filter(|part| !part.is_empty())
-            .count()
-            > limits.max_nesting_depth
-        {
-            return Err(Error::ResourceLimit("entry path depth"));
-        }
-
-        let size = entry.data.len() as u64;
-        if size > limits.max_entry_bytes {
-            return Err(Error::ResourceLimit("entry decoded bytes"));
-        }
-        total = total
-            .checked_add(size)
-            .ok_or(Error::ResourceLimit("total decoded bytes"))?;
-        metadata = metadata
-            .checked_add(entry.name.len() as u64)
-            .ok_or(Error::ResourceLimit("metadata bytes"))?;
-    }
-    if total > limits.max_total_bytes {
-        return Err(Error::ResourceLimit("total decoded bytes"));
-    }
-    if metadata > limits.max_metadata_bytes {
-        return Err(Error::ResourceLimit("metadata bytes"));
-    }
+    validate_creation(
+        entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.kind, e.data.len() as u64)),
+        limits,
+    )?;
     match format {
         #[cfg(feature = "tar")]
         Format::Tar => tar_backend::create_with_metadata(entries, writer, metadata_values),
@@ -1433,44 +1417,15 @@ pub fn create_with_options<W: Write + Seek>(
     limits: Limits,
     mut options: CreateOptions<'_>,
 ) -> Result<()> {
-    let mut metadata = 0u64;
-    let mut total = 0u64;
-    if entries.len() as u64 > limits.max_entries {
-        return Err(Error::ResourceLimit("entries"));
-    }
-    for entry in entries {
-        if entry.kind == EntryKind::Directory && !entry.data.is_empty() {
-            return Err(Error::Malformed(
-                "directory entry has a nonzero payload size".into(),
-            ));
-        }
-        if entry
-            .name
-            .as_bytes()
-            .split(|byte| matches!(byte, b'/' | b'\\'))
-            .filter(|part| !part.is_empty())
-            .count()
-            > limits.max_nesting_depth
-        {
-            return Err(Error::ResourceLimit("entry path depth"));
-        }
-
-        let size = entry.data.len() as u64;
-        if size > limits.max_entry_bytes {
-            return Err(Error::ResourceLimit("entry decoded bytes"));
-        }
-        total = total
-            .checked_add(size)
-            .ok_or(Error::ResourceLimit("total decoded bytes"))?;
-        metadata = metadata
-            .checked_add(entry.name.len() as u64)
-            .ok_or(Error::ResourceLimit("metadata bytes"))?;
-    }
-    if total > limits.max_total_bytes {
-        return Err(Error::ResourceLimit("total decoded bytes"));
-    }
-    if metadata > limits.max_metadata_bytes {
-        return Err(Error::ResourceLimit("metadata bytes"));
+    validate_create_options(format, &options, limits)?;
+    validate_creation(
+        entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.kind, e.data.len() as u64)),
+        limits,
+    )?;
+    if format == Format::Zip && options.zip_compression == ZipCompression::Deflate {
+        check_deflate_encoder(limits)?;
     }
     if options
         .entry_metadata
@@ -1480,98 +1435,20 @@ pub fn create_with_options<W: Write + Seek>(
     }
     #[cfg(feature = "sevenz")]
     if format == Format::SevenZip {
-        if options.sevenz_compression == SevenZipCompression::Deflate
-            && (limits.max_dictionary_bytes < 32768 || limits.max_active_workspace_bytes < 1 << 20)
-        {
-            return Err(Error::ResourceLimit("7z DEFLATE workspace"));
-        }
-        let index: Vec<_> = entries
-            .iter()
-            .enumerate()
-            .map(|(i, entry)| Entry {
-                id: EntryId(i),
-                raw_name: entry.name.as_bytes().to_vec(),
-                name: entry.name.clone(),
-                kind: entry.kind,
-                size: entry.data.len() as u64,
-                compressed_size: None,
-                compression: String::new(),
-                encrypted: false,
-            })
-            .collect();
-        validate_index(&index, limits)?;
-        return sevenz_backend::create(entries, writer, &mut options);
+        return sevenz_backend::create(entries, writer, &mut options, limits);
     }
     #[cfg(feature = "cab")]
-    if options.password.is_none() && format == Format::Cab {
-        let defaults;
-        let values = if let Some(values) = options.entry_metadata {
-            values
-        } else {
-            defaults = vec![EntryMetadata::default(); entries.len()];
-            &defaults
-        };
-        if (options.cab_compression == CabCompression::MsZip
-            && (limits.max_dictionary_bytes < 32768 || limits.max_active_workspace_bytes < 1 << 20))
-            || (matches!(
-                options.cab_compression,
-                CabCompression::Lzx | CabCompression::Quantum
-            ) && (limits.max_dictionary_bytes < 2 << 20
-                || limits.max_active_workspace_bytes < 64 << 20))
-        {
-            return Err(Error::ResourceLimit("CAB encoder workspace bytes"));
-        }
-        let mut builder = cabinet::CabinetBuilder::new(match options.cab_compression {
-            CabCompression::Copy => cabinet::WriteCompression::None,
-            CabCompression::MsZip => cabinet::WriteCompression::MsZip,
-            CabCompression::Lzx => cabinet::WriteCompression::Lzx { window_order: 21 },
-            CabCompression::Quantum => cabinet::WriteCompression::Quantum {
-                level: 6,
-                window_order: 21,
-            },
-        });
-        for (entry, metadata) in entries.iter().zip(values) {
-            if entry.kind != EntryKind::File {
-                return Err(Error::Unsupported("CAB directories and links".into()));
-            }
-            if let Some(StoredTimestamp::DosLocal {
-                year,
-                month,
-                day,
-                hour,
-                minute,
-                second,
-            }) = metadata.modified
-            {
-                if !(1980..=2107).contains(&year) {
-                    return Err(Error::Unsupported(
-                        "CAB timestamp year must be 1980 through 2107".into(),
-                    ));
-                }
-                let date = ((year - 1980) << 9) | (u16::from(month) << 5) | u16::from(day);
-                let time =
-                    (u16::from(hour) << 11) | (u16::from(minute) << 5) | u16::from(second / 2);
-                let attributes = 0x20
-                    | if metadata.unix_mode.is_some_and(|mode| mode & 0o222 == 0) {
-                        1
-                    } else {
-                        0
-                    };
-                builder.add_file_with_metadata(&entry.name, &entry.data, date, time, attributes)?;
-            } else {
-                builder.add_file(&entry.name, &entry.data)?;
-            }
-        }
-        builder.write(writer)?;
-        return Ok(());
+    if format == Format::Cab {
+        return cab_backend::create_readers(
+            entries,
+            &mut |index| Ok(Box::new(io::Cursor::new(entries[index].data.as_slice()))),
+            writer,
+            limits,
+            &options,
+        );
     }
     #[cfg(feature = "zip")]
     if format == Format::Zip && options.password.is_none() {
-        if options.zip_compression == ZipCompression::Deflate
-            && (limits.max_dictionary_bytes < 32768 || limits.max_active_workspace_bytes < 1 << 20)
-        {
-            return Err(Error::ResourceLimit("DEFLATE encoder workspace bytes"));
-        }
         return zip_backend::create_with_compression(
             entries,
             writer,
@@ -1614,17 +1491,6 @@ pub fn create_with_options<W: Write + Seek>(
         let random = options.randomness.as_deref_mut().ok_or_else(|| {
             Error::Unsupported("encrypted creation requires secure randomness".into())
         })?;
-        let total = entries.iter().try_fold(0u64, |total, e| {
-            total
-                .checked_add(e.data.len() as u64)
-                .ok_or(Error::ResourceLimit("total decoded bytes"))
-        })?;
-        if total > limits.max_total_bytes {
-            return Err(Error::ResourceLimit("total decoded bytes"));
-        }
-        if entries.len() as u64 > limits.max_entries {
-            return Err(Error::ResourceLimit("entries"));
-        }
         zip_backend::create_encrypted(
             entries,
             writer,
@@ -1640,6 +1506,78 @@ pub fn create_with_options<W: Write + Seek>(
         let _ = (&mut options, writer, entries, limits);
         Err(Error::Unsupported("ZIP crypto feature unavailable".into()))
     }
+}
+fn validate_create_options(
+    format: Format,
+    options: &CreateOptions<'_>,
+    limits: Limits,
+) -> Result<()> {
+    if options.encrypt_headers && (format != Format::SevenZip || options.password.is_none()) {
+        return Err(Error::Unsupported(
+            "header encryption requires encrypted 7z".into(),
+        ));
+    }
+    if options.password.is_some() {
+        let work = match format {
+            Format::Zip if options.zip_encryption == ZipEncryption::Aes256 => 1000,
+            Format::SevenZip => 1 << 19,
+            _ => 0,
+        };
+        if work > limits.max_password_iterations {
+            return Err(Error::ResourceLimit("password work"));
+        }
+    }
+    Ok(())
+}
+fn check_deflate_encoder(limits: Limits) -> Result<()> {
+    if limits.max_dictionary_bytes < 32768 || limits.max_active_workspace_bytes < 1 << 20 {
+        return Err(Error::ResourceLimit("DEFLATE encoder workspace bytes"));
+    }
+    Ok(())
+}
+fn validate_creation<'a>(
+    entries: impl IntoIterator<Item = (&'a str, EntryKind, u64)>,
+    limits: Limits,
+) -> Result<()> {
+    let (mut count, mut total, mut metadata) = (0u64, 0u64, 0u64);
+    for (name, kind, size) in entries {
+        count = count
+            .checked_add(1)
+            .ok_or(Error::ResourceLimit("entries"))?;
+        if count > limits.max_entries {
+            return Err(Error::ResourceLimit("entries"));
+        }
+        if kind == EntryKind::Directory && size != 0 {
+            return Err(Error::Malformed(
+                "directory entry has a nonzero payload size".into(),
+            ));
+        }
+        if name
+            .as_bytes()
+            .split(|byte| matches!(byte, b'/' | b'\\'))
+            .filter(|part| !part.is_empty())
+            .count()
+            > limits.max_nesting_depth
+        {
+            return Err(Error::ResourceLimit("entry path depth"));
+        }
+        if size > limits.max_entry_bytes {
+            return Err(Error::ResourceLimit("entry decoded bytes"));
+        }
+        total = total
+            .checked_add(size)
+            .ok_or(Error::ResourceLimit("total decoded bytes"))?;
+        metadata = metadata
+            .checked_add(name.len() as u64)
+            .ok_or(Error::ResourceLimit("metadata bytes"))?;
+    }
+    if total > limits.max_total_bytes {
+        return Err(Error::ResourceLimit("total decoded bytes"));
+    }
+    if metadata > limits.max_metadata_bytes {
+        return Err(Error::ResourceLimit("metadata bytes"));
+    }
+    Ok(())
 }
 fn validate_index(entries: &[Entry], limits: Limits) -> Result<()> {
     if entries.len() as u64 > limits.max_entries {

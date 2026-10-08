@@ -30,7 +30,7 @@ self.onmessage = async () => {
         archive.free();
       }
     }
-    for (const format of ['gzip', 'zlib', 'deflate', 'lzma', 'bzip2', 'brotli', 'tar.bz2', 'tar.br']) {
+    for (const format of ['gzip', 'zlib', 'deflate', 'lzma', 'bzip2', 'brotli', 'tar.bz2', 'tar.br', 'TGZ', 'txz', 'tbz']) {
       stage = format;
       const bytes = create_file(format, 'payload.txt', payload, 1024n * 1024n);
       const archive = ByteArchive.with_format(bytes, format, 1024n * 1024n);

@@ -67,3 +67,18 @@ fn explicit_external_media_mapping_extracts_without_automatic_search() {
         include_bytes!("fixtures/data.cab")
     );
 }
+
+#[test]
+fn listing_msi_enforces_compound_input_budget() {
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("external.msi");
+    std::fs::write(&input, include_bytes!("fixtures/external.msi")).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_arc"))
+        .args(["--json", "--max-input-bytes", "1", "list"])
+        .arg(input)
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(5));
+    let json: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(json["ok"], false);
+}

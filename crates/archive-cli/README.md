@@ -228,6 +228,23 @@ example, `arc --max-entry-bytes 67108864 --max-total-bytes 268435456
 and total decoded output to 256 MiB. Defaults are 1 GiB input, 8 GiB per entry,
 32 GiB output and 100,000 entries.
 
+Codec memory follows 7-Zip's `memuse` policy. The default `--memuse=auto`
+uses 80% of detected physical RAM for creation/compression and 17/32
+(53.125%) for reading/decompression. `--memuse=p80` or `--memuse=80%`
+selects a percentage; `--memuse=512m` selects a fixed budget. Integer bytes
+and binary `b`, `k`, `m`, `g`, `t` suffixes are accepted. The spellings
+`--mmemuse=512m` and `-mmemuse=512m` are also accepted. When native RAM
+queries fail, the default is 2 GiB on 64-bit hosts or 1 GiB on 32-bit hosts.
+These are codec workspace budgets, not process-wide RSS limits. Explicit
+`--max-codec-workspace-bytes` and `--max-dictionary-bytes` can impose tighter
+byte ceilings; there is no separate fixed 64 MiB dictionary ceiling by default.
+
+Extraction requests the number of workers reported by the OS by default.
+`--threads N` selects a worker upper bound; codecs, archive structure, and
+memory admission can reduce the actual worker count. TAR, TAR.gz, TAR.xz,
+ZIP (including encrypted ZIP), 7z, and CAB creation open one source payload at a
+time instead of retaining every file in memory.
+
 Compressed TAR uses temporary-file storage bounded by decoded output limits.
 Library callers choosing in-memory indexing additionally have a 256 MiB
 `Limits::max_buffered_bytes` cap. Neither is a process-wide memory limit.

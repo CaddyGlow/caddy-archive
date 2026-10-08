@@ -49,28 +49,6 @@ fn derive(password: &[u8], salt: &[u8], key_size: usize) -> Result<Zeroizing<Vec
         .map_err(|_| Error::Malformed("password derivation".into()))?;
     Ok(derived)
 }
-pub(crate) fn encrypt(
-    data: &mut Vec<u8>,
-    password: &[u8],
-    random: &mut dyn crate::RandomSource,
-) -> Result<()> {
-    let mut salt = [0u8; 16];
-    random.fill(&mut salt)?;
-    let derived = derive(password, &salt, 32)?;
-    let mut cipher = Cipher::new(&derived[..32])?;
-    cipher.apply(data);
-    let mut mac = Authentication::new_from_slice(&derived[32..64])
-        .map_err(|_| Error::Malformed("authentication key".into()))?;
-    mac.update(data);
-    let tag = mac.finalize().into_bytes();
-    let mut result = Vec::with_capacity(data.len() + 28);
-    result.extend_from_slice(&salt);
-    result.extend_from_slice(&derived[64..66]);
-    result.extend_from_slice(data);
-    result.extend_from_slice(&tag[..10]);
-    *data = result;
-    Ok(())
-}
 pub(crate) struct DecryptReader<R> {
     reader: R,
     cipher: Cipher,
@@ -204,25 +182,83 @@ pub(crate) fn legacy_decrypt<R: Read>(
     }
     Ok(reader)
 }
-pub(crate) fn legacy_encrypt(
-    data: &mut Vec<u8>,
-    password: &[u8],
-    check: u8,
-    random: &mut dyn crate::RandomSource,
-) -> Result<()> {
-    if password.len() > 1 << 20 {
-        return Err(Error::ResourceLimit("password bytes"));
+pub(crate) struct EncryptWriter<W> {
+    writer: W,
+    state: EncryptState,
+}
+enum EncryptState {
+    Aes { cipher: Cipher, mac: Authentication },
+    Legacy(LegacyKeys),
+}
+impl<W: std::io::Write> EncryptWriter<W> {
+    pub(crate) fn new(
+        mut writer: W,
+        password: &[u8],
+        random: &mut dyn crate::RandomSource,
+        mode: crate::ZipEncryption,
+        check: u8,
+    ) -> Result<Self> {
+        let state = match mode {
+            crate::ZipEncryption::Aes256 => {
+                let mut salt = [0; 16];
+                random.fill(&mut salt)?;
+                let derived = derive(password, &salt, 32)?;
+                writer.write_all(&salt)?;
+                writer.write_all(&derived[64..66])?;
+                EncryptState::Aes {
+                    cipher: Cipher::new(&derived[..32])?,
+                    mac: Authentication::new_from_slice(&derived[32..64])
+                        .map_err(|_| Error::Malformed("authentication key".into()))?,
+                }
+            }
+            crate::ZipEncryption::ZipCrypto => {
+                if password.len() > 1 << 20 {
+                    return Err(Error::ResourceLimit("password bytes"));
+                }
+                let mut keys = LegacyKeys::new(password);
+                let mut header = [0; 12];
+                random.fill(&mut header[..11])?;
+                header[11] = check;
+                for byte in &mut header {
+                    let plain = *byte;
+                    *byte ^= keys.mask();
+                    keys.update(plain);
+                }
+                writer.write_all(&header)?;
+                EncryptState::Legacy(keys)
+            }
+        };
+        Ok(Self { writer, state })
     }
-    let mut header = [0u8; 12];
-    random.fill(&mut header[..11])?;
-    header[11] = check;
-    let mut keys = LegacyKeys::new(password);
-    let mut encrypted = Vec::with_capacity(data.len() + 12);
-    for byte in header.iter().chain(data.iter()) {
-        let cipher = *byte ^ keys.mask();
-        keys.update(*byte);
-        encrypted.push(cipher);
+    pub(crate) fn finish(mut self) -> Result<()> {
+        if let EncryptState::Aes { mac, .. } = self.state {
+            self.writer.write_all(&mac.finalize().into_bytes()[..10])?;
+        }
+        Ok(())
     }
-    *data = encrypted;
-    Ok(())
+}
+impl<W: std::io::Write> std::io::Write for EncryptWriter<W> {
+    fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+        let mut buffer = [0; 65536];
+        let count = input.len().min(buffer.len());
+        buffer[..count].copy_from_slice(&input[..count]);
+        match &mut self.state {
+            EncryptState::Aes { cipher, mac } => {
+                cipher.apply(&mut buffer[..count]);
+                mac.update(&buffer[..count]);
+            }
+            EncryptState::Legacy(keys) => {
+                for byte in &mut buffer[..count] {
+                    let plain = *byte;
+                    *byte ^= keys.mask();
+                    keys.update(plain);
+                }
+            }
+        }
+        self.writer.write_all(&buffer[..count])?;
+        Ok(count)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
 }

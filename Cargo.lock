@@ -174,10 +174,10 @@ dependencies = [
 
 [[package]]
 name = "caddy-archive-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "caddy-archive-core 0.1.0",
- "caddy-archive-core 0.2.0",
+ "caddy-archive-core 0.2.1",
  "caddy-archive-fs",
  "clap",
  "indicatif",
@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-archive-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aes",
  "brotli",
@@ -234,19 +234,19 @@ dependencies = [
 
 [[package]]
 name = "caddy-archive-fs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
- "caddy-archive-core 0.2.0",
+ "caddy-archive-core 0.2.1",
  "libc",
  "tempfile",
 ]
 
 [[package]]
 name = "caddy-archive-wasm"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "caddy-archive-core 0.1.0",
- "caddy-archive-core 0.2.0",
+ "caddy-archive-core 0.2.1",
  "ms-package",
  "serde",
  "serde_json",
@@ -690,9 +690,9 @@ dependencies = [
 
 [[package]]
 name = "ms-cabinet"
-version = "0.1.2"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17cfbe537ecc5b9642100014b72880f5a2942b8718bea46d758ff9348355272d"
+checksum = "8d1e19e1a3f2fa2621ca60922c1a7eea12df0ce98d26a7a26e2d7b6e38205c6f"
 dependencies = [
  "flate2",
  "ms-compress",

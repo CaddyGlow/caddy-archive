@@ -152,10 +152,27 @@ pub(crate) fn create_with_metadata(
     writer: &mut impl Write,
     metadata: Option<&[crate::EntryMetadata]>,
 ) -> Result<()> {
+    create_readers(
+        entries,
+        &mut |index| {
+            Ok(Box::new(std::io::Cursor::new(
+                entries[index].data.as_slice(),
+            )))
+        },
+        writer,
+        metadata,
+    )
+}
+pub(crate) fn create_readers<'a, E: crate::CreationEntry>(
+    entries: &[E],
+    open: &mut impl FnMut(usize) -> Result<Box<dyn Read + 'a>>,
+    writer: &mut impl Write,
+    metadata: Option<&[crate::EntryMetadata]>,
+) -> Result<()> {
     let mut builder = tar::Builder::new(writer);
     for (index, entry) in entries.iter().enumerate() {
         let mut header = tar::Header::new_ustar();
-        header.set_mode(if entry.kind == EntryKind::Directory {
+        header.set_mode(if entry.source_kind() == EntryKind::Directory {
             0o755
         } else {
             0o644
@@ -177,10 +194,10 @@ pub(crate) fn create_with_metadata(
                 header.set_gid(gid);
             }
         }
-        match entry.kind {
+        match entry.source_kind() {
             EntryKind::File => {
                 header.set_entry_type(tar::EntryType::Regular);
-                header.set_size(entry.data.len() as u64);
+                header.set_size(entry.source_size());
             }
             EntryKind::Directory => {
                 header.set_entry_type(tar::EntryType::Directory);
@@ -188,19 +205,21 @@ pub(crate) fn create_with_metadata(
             }
             _ => return Err(Error::Unsupported("TAR link creation".into())),
         }
-        if header.set_path(&entry.name).is_err() {
-            builder.append_pax_extensions([("path", entry.name.as_bytes())])?;
+        if header.set_path(entry.source_name()).is_err() {
+            builder.append_pax_extensions([("path", entry.source_name().as_bytes())])?;
             header.set_path("PaxPayload")?;
         }
         header.set_cksum();
-        builder.append(
-            &header,
-            if entry.kind == EntryKind::File {
-                entry.data.as_slice()
-            } else {
-                &[]
-            },
-        )?;
+        if entry.source_kind() == EntryKind::File {
+            let mut source = open(index)?;
+            let mut payload = source.by_ref().take(entry.source_size());
+            builder.append(&header, &mut payload)?;
+            if payload.limit() != 0 || source.read(&mut [0u8; 1])? != 0 {
+                return Err(Error::Malformed("creation source size changed".into()));
+            }
+        } else {
+            builder.append(&header, std::io::empty())?;
+        }
     }
     builder.finish()?;
     Ok(())

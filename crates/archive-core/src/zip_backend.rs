@@ -11,158 +11,207 @@ pub(crate) struct Location {
     header: u64,
     pub(crate) metadata: crate::EntryMetadata,
 }
-#[allow(deprecated)]
+/// Retains completed members and local-header validation across sparse read misses.
+pub(crate) struct Indexer<R> {
+    archive: Option<zip::ZipArchive<R>>,
+    reader: Option<R>,
+    entries: Vec<Entry>,
+    locations: Vec<Location>,
+    metadata: u64,
+    validated: usize,
+    limits: Limits,
+}
+impl<R: Read + Seek> Indexer<R> {
+    pub(crate) fn new(reader: R, limits: Limits, declared_entries: u64) -> Result<Self> {
+        let zip = zip::ZipArchive::new(reader).map_err(|e| Error::Malformed(e.to_string()))?;
+        // The dependency indexes by name and can silently discard duplicate entries.
+        if zip.len() as u64 != declared_entries {
+            return Err(Error::Unsupported(
+                "ZIP index omits entries (possibly duplicate filenames)".into(),
+            ));
+        }
+        Ok(Self {
+            archive: Some(zip),
+            reader: None,
+            entries: Vec::new(),
+            locations: Vec::new(),
+            metadata: 0,
+            validated: 0,
+            limits,
+        })
+    }
+    #[allow(deprecated)]
+    pub(crate) fn poll(&mut self) -> Result<()> {
+        let limits = self.limits;
+        if let Some(zip) = &mut self.archive {
+            while self.entries.len() < zip.len() {
+                let i = self.entries.len();
+                let file = zip
+                    .by_index_raw(i)
+                    .map_err(|e| Error::Malformed(e.to_string()))?;
+                let raw = file.name_raw().to_vec();
+                self.metadata = self
+                    .metadata
+                    .checked_add(raw.len() as u64)
+                    .and_then(|bytes| {
+                        bytes.checked_add(std::mem::size_of::<crate::EntryMetadata>() as u64)
+                    })
+                    .ok_or(Error::ResourceLimit("metadata bytes"))?;
+                if self.metadata > limits.max_metadata_bytes {
+                    return Err(Error::ResourceLimit("metadata bytes"));
+                }
+                let method = file.compression().to_u16();
+                if method == 8 && limits.max_dictionary_bytes < 32768 {
+                    return Err(Error::ResourceLimit("dictionary bytes"));
+                }
+                if method == 8 && limits.max_active_workspace_bytes < 1 << 20 {
+                    return Err(Error::ResourceLimit("active decoder workspace bytes"));
+                }
+                let aes = aes_extra(file.extra_data().unwrap_or_default())?;
+                if aes.is_some() && limits.max_password_iterations < 1000 {
+                    return Err(Error::ResourceLimit("password derivation iterations"));
+                }
+                self.locations.push(Location {
+                    offset: file.data_start(),
+                    compressed: file.compressed_size(),
+                    method,
+                    crc: file.crc32(),
+                    aes,
+                    encrypted: file.encrypted(),
+                    header: file.header_start(),
+                    metadata: crate::EntryMetadata {
+                        modified: unix_mtime(file.extra_data().unwrap_or_default())?.or_else(
+                            || {
+                                file.last_modified()
+                                    .map(|date| crate::StoredTimestamp::DosLocal {
+                                        year: date.year(),
+                                        month: date.month(),
+                                        day: date.day(),
+                                        hour: date.hour(),
+                                        minute: date.minute(),
+                                        second: date.second(),
+                                    })
+                            },
+                        ),
+                        unix_mode: file.unix_mode(),
+                        format: Some(crate::EntryFormatMetadata::Zip {
+                            crc32: file.crc32(),
+                            compression_method: method,
+                            aes_version: aes.map(|value| value.0),
+                            aes_strength: aes.map(|value| value.1),
+                        }),
+                        ..Default::default()
+                    },
+                });
+                let kind = if file.is_dir() {
+                    EntryKind::Directory
+                } else if file.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000) {
+                    EntryKind::Link
+                } else {
+                    EntryKind::File
+                };
+                self.entries.push(Entry {
+                    id: EntryId(i),
+                    raw_name: raw,
+                    name: file.name().into(),
+                    kind,
+                    size: file.size(),
+                    compressed_size: Some(file.compressed_size()),
+                    compression: format!("{:?}", file.compression()),
+                    encrypted: file.encrypted(),
+                });
+            }
+        }
+        if let Some(zip) = self.archive.take() {
+            self.reader = Some(zip.into_inner());
+        }
+        let reader = self
+            .reader
+            .as_mut()
+            .ok_or_else(|| Error::Malformed("ZIP index state".into()))?;
+        let length = reader.seek(SeekFrom::End(0))?;
+        while self.validated < self.entries.len() {
+            let location = &self.locations[self.validated];
+            let entry = &self.entries[self.validated];
+            if location
+                .offset
+                .checked_add(location.compressed)
+                .is_none_or(|end| end > length)
+            {
+                return Err(Error::Malformed("ZIP payload exceeds input".into()));
+            }
+            reader.seek(SeekFrom::Start(location.header))?;
+            let mut local = [0u8; 30];
+            reader.read_exact(&mut local)?;
+            if !local.starts_with(b"PK\x03\x04") {
+                return Err(Error::Malformed("ZIP local header signature".into()));
+            }
+            let flags = u16::from_le_bytes([local[6], local[7]]);
+            let method = u16::from_le_bytes([local[8], local[9]]);
+            if flags & 0x2040 != 0 {
+                return Err(Error::Unsupported("ZIP strong/header encryption".into()));
+            }
+            if (flags & 1 != 0) != location.encrypted
+                || method
+                    != if location.aes.is_some() {
+                        99
+                    } else {
+                        location.method
+                    }
+            {
+                return Err(Error::Malformed(
+                    "ZIP local and central flags/method mismatch".into(),
+                ));
+            }
+            let name_len = usize::from(u16::from_le_bytes([local[26], local[27]]));
+            if name_len as u64 > limits.max_metadata_bytes {
+                return Err(Error::ResourceLimit("metadata bytes"));
+            }
+            let mut name = vec![0u8; name_len];
+            reader.read_exact(&mut name)?;
+            if name != entry.raw_name {
+                return Err(Error::Malformed(
+                    "ZIP local and central filename mismatch".into(),
+                ));
+            }
+
+            self.validated += 1;
+        }
+        // Include local headers in the ranges: a member hidden inside another
+        // member's payload is also an overlapping ZIP bomb.
+        let mut ranges: Vec<_> = self
+            .locations
+            .iter()
+            .map(|location| {
+                let end = location
+                    .offset
+                    .checked_add(location.compressed)
+                    .ok_or_else(|| Error::Malformed("ZIP payload range overflow".into()))?;
+                Ok((location.header, end))
+            })
+            .collect::<Result<_>>()?;
+        ranges.sort_unstable();
+        if ranges.windows(2).any(|pair| pair[1].0 < pair[0].1) {
+            return Err(Error::Malformed("overlapping ZIP members".into()));
+        }
+
+        Ok(())
+    }
+    pub(crate) fn finish(self) -> Result<(R, Vec<Entry>, Vec<Location>)> {
+        let reader = self
+            .reader
+            .ok_or_else(|| Error::Malformed("ZIP index incomplete".into()))?;
+        Ok((reader, self.entries, self.locations))
+    }
+}
 pub(crate) fn index<R: Read + Seek>(
     mut reader: R,
     limits: Limits,
 ) -> Result<(R, Vec<Entry>, Vec<Location>)> {
-    let declared_entries = preflight(&mut reader, limits)?;
-    let mut zip = zip::ZipArchive::new(reader).map_err(|e| Error::Malformed(e.to_string()))?;
-    // The dependency indexes by name and can silently discard duplicate entries.
-    if zip.len() as u64 != declared_entries {
-        return Err(Error::Unsupported(
-            "ZIP index omits entries (possibly duplicate filenames)".into(),
-        ));
-    }
-    if zip.len() as u64 > limits.max_entries {
-        return Err(Error::ResourceLimit("entries"));
-    }
-    let mut entries = Vec::new();
-    let mut locations = Vec::new();
-    let mut metadata = 0u64;
-    for i in 0..zip.len() {
-        let file = zip
-            .by_index_raw(i)
-            .map_err(|e| Error::Malformed(e.to_string()))?;
-        let raw = file.name_raw().to_vec();
-        metadata = metadata
-            .checked_add(raw.len() as u64)
-            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<crate::EntryMetadata>() as u64))
-            .ok_or(Error::ResourceLimit("metadata bytes"))?;
-        if metadata > limits.max_metadata_bytes {
-            return Err(Error::ResourceLimit("metadata bytes"));
-        }
-        let method = file.compression().to_u16();
-        if method == 8 && limits.max_dictionary_bytes < 32768 {
-            return Err(Error::ResourceLimit("dictionary bytes"));
-        }
-        if method == 8 && limits.max_active_workspace_bytes < 1 << 20 {
-            return Err(Error::ResourceLimit("active decoder workspace bytes"));
-        }
-        let aes = aes_extra(file.extra_data().unwrap_or_default())?;
-        if aes.is_some() && limits.max_password_iterations < 1000 {
-            return Err(Error::ResourceLimit("password derivation iterations"));
-        }
-        locations.push(Location {
-            offset: file.data_start(),
-            compressed: file.compressed_size(),
-            method,
-            crc: file.crc32(),
-            aes,
-            encrypted: file.encrypted(),
-            header: file.header_start(),
-            metadata: crate::EntryMetadata {
-                modified: unix_mtime(file.extra_data().unwrap_or_default())?.or_else(|| {
-                    file.last_modified()
-                        .map(|date| crate::StoredTimestamp::DosLocal {
-                            year: date.year(),
-                            month: date.month(),
-                            day: date.day(),
-                            hour: date.hour(),
-                            minute: date.minute(),
-                            second: date.second(),
-                        })
-                }),
-                unix_mode: file.unix_mode(),
-                format: Some(crate::EntryFormatMetadata::Zip {
-                    crc32: file.crc32(),
-                    compression_method: method,
-                    aes_version: aes.map(|value| value.0),
-                    aes_strength: aes.map(|value| value.1),
-                }),
-                ..Default::default()
-            },
-        });
-        let kind = if file.is_dir() {
-            EntryKind::Directory
-        } else if file.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000) {
-            EntryKind::Link
-        } else {
-            EntryKind::File
-        };
-        entries.push(Entry {
-            id: EntryId(i),
-            raw_name: raw,
-            name: file.name().into(),
-            kind,
-            size: file.size(),
-            compressed_size: Some(file.compressed_size()),
-            compression: format!("{:?}", file.compression()),
-            encrypted: file.encrypted(),
-        });
-    }
-    let mut reader = zip.into_inner();
-    // Include local headers in the ranges: a member hidden inside another
-    // member's payload is also an overlapping ZIP bomb.
-    let mut ranges: Vec<_> = locations
-        .iter()
-        .map(|location| {
-            let end = location
-                .offset
-                .checked_add(location.compressed)
-                .ok_or_else(|| Error::Malformed("ZIP payload range overflow".into()))?;
-            Ok((location.header, end))
-        })
-        .collect::<Result<_>>()?;
-    ranges.sort_unstable();
-    if ranges.windows(2).any(|pair| pair[1].0 < pair[0].1) {
-        return Err(Error::Malformed("overlapping ZIP members".into()));
-    }
-    let length = reader.seek(SeekFrom::End(0))?;
-    for (location, entry) in locations.iter().zip(&entries) {
-        if location
-            .offset
-            .checked_add(location.compressed)
-            .is_none_or(|end| end > length)
-        {
-            return Err(Error::Malformed("ZIP payload exceeds input".into()));
-        }
-        reader.seek(SeekFrom::Start(location.header))?;
-        let mut local = [0u8; 30];
-        reader.read_exact(&mut local)?;
-        if !local.starts_with(b"PK\x03\x04") {
-            return Err(Error::Malformed("ZIP local header signature".into()));
-        }
-        let flags = u16::from_le_bytes([local[6], local[7]]);
-        let method = u16::from_le_bytes([local[8], local[9]]);
-        if flags & 0x2040 != 0 {
-            return Err(Error::Unsupported("ZIP strong/header encryption".into()));
-        }
-        if (flags & 1 != 0) != location.encrypted
-            || method
-                != if location.aes.is_some() {
-                    99
-                } else {
-                    location.method
-                }
-        {
-            return Err(Error::Malformed(
-                "ZIP local and central flags/method mismatch".into(),
-            ));
-        }
-        let name_len = usize::from(u16::from_le_bytes([local[26], local[27]]));
-        if name_len as u64 > limits.max_metadata_bytes {
-            return Err(Error::ResourceLimit("metadata bytes"));
-        }
-        let mut name = vec![0u8; name_len];
-        reader.read_exact(&mut name)?;
-        if name != entry.raw_name {
-            return Err(Error::Malformed(
-                "ZIP local and central filename mismatch".into(),
-            ));
-        }
-    }
-    Ok((reader, entries, locations))
+    let preflight = preflight(&mut reader, limits)?;
+    let mut index = Indexer::new(reader, limits, preflight.entries)?;
+    index.poll()?;
+    index.finish()
 }
 fn unix_mtime(mut extra: &[u8]) -> Result<Option<crate::StoredTimestamp>> {
     while extra.len() >= 4 {
@@ -203,7 +252,12 @@ fn aes_extra(mut extra: &[u8]) -> Result<Option<(u16, u8)>> {
     }
     Ok(None)
 }
-fn preflight(reader: &mut (impl Read + Seek), limits: Limits) -> Result<u64> {
+pub(crate) struct Preflight {
+    pub(crate) entries: u64,
+    pub(crate) directory_start: u64,
+    pub(crate) directory_size: u64,
+}
+pub(crate) fn preflight(reader: &mut (impl Read + Seek), limits: Limits) -> Result<Preflight> {
     let length = reader.seek(SeekFrom::End(0))?;
     let tail_len = length.min(65557);
     reader.seek(SeekFrom::Start(length - tail_len))?;
@@ -224,6 +278,7 @@ fn preflight(reader: &mut (impl Read + Seek), limits: Limits) -> Result<u64> {
     if tail.len() - eocd < 22 {
         return Err(Error::Malformed("truncated ZIP end record".into()));
     }
+    let mut directory_end = length - tail_len + eocd as u64;
     let record = &tail[eocd..];
     let mut count = u64::from(u16::from_le_bytes([record[10], record[11]]));
     let mut size = u64::from(u32::from_le_bytes(
@@ -247,6 +302,7 @@ fn preflight(reader: &mut (impl Read + Seek), limits: Limits) -> Result<u64> {
                 .try_into()
                 .map_err(|_| Error::Malformed("ZIP64 locator".into()))?,
         );
+        directory_end = offset;
         reader.seek(SeekFrom::Start(offset))?;
         let mut zip64 = [0u8; 56];
         reader.read_exact(&mut zip64)?;
@@ -276,7 +332,13 @@ fn preflight(reader: &mut (impl Read + Seek), limits: Limits) -> Result<u64> {
         return Err(Error::ResourceLimit("metadata bytes"));
     }
     reader.rewind()?;
-    Ok(count)
+    Ok(Preflight {
+        entries: count,
+        directory_start: directory_end
+            .checked_sub(size)
+            .ok_or_else(|| Error::Malformed("ZIP central directory range".into()))?,
+        directory_size: size,
+    })
 }
 struct CheckedWriter<'a, W> {
     writer: &'a mut W,
@@ -432,11 +494,38 @@ pub(crate) fn create_encrypted(
 fn create_impl(
     entries: &[CreateEntry],
     writer: &mut (impl Write + Seek),
+    encryption: Option<(&[u8], &mut dyn crate::RandomSource)>,
+    mode: crate::ZipEncryption,
+    metadata: Option<&[crate::EntryMetadata]>,
+    compression: crate::ZipCompression,
+) -> Result<()> {
+    create_readers(
+        entries,
+        &mut |index| {
+            Ok(Box::new(std::io::Cursor::new(
+                entries[index].data.as_slice(),
+            )))
+        },
+        writer,
+        encryption,
+        mode,
+        metadata,
+        compression,
+    )
+}
+pub(crate) fn create_readers<'a, E: crate::CreationEntry>(
+    entries: &[E],
+    open: &mut impl FnMut(usize) -> Result<Box<dyn Read + 'a>>,
+    writer: &mut (impl Write + Seek),
     mut encryption: Option<(&[u8], &mut dyn crate::RandomSource)>,
     mode: crate::ZipEncryption,
     metadata: Option<&[crate::EntryMetadata]>,
     compression: crate::ZipCompression,
 ) -> Result<()> {
+    #[cfg(not(feature = "crypto"))]
+    if encryption.is_some() {
+        return Err(Error::Unsupported("ZIP crypto feature unavailable".into()));
+    }
     let mut central = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
         let metadata = metadata.and_then(|values| values.get(index));
@@ -468,51 +557,28 @@ fn create_impl(
             timestamp.extend_from_slice(&seconds.to_le_bytes());
         }
         let timestamp_len = timestamp.len() as u16;
-        if !matches!(entry.kind, EntryKind::File | EntryKind::Directory) {
+        if !matches!(entry.source_kind(), EntryKind::File | EntryKind::Directory) {
             return Err(Error::Unsupported("ZIP link creation".into()));
         }
-        let name = if entry.kind == EntryKind::Directory && !entry.name.ends_with('/') {
-            format!("{}/", entry.name)
-        } else {
-            entry.name.clone()
-        };
+        let name =
+            if entry.source_kind() == EntryKind::Directory && !entry.source_name().ends_with('/') {
+                format!("{}/", entry.source_name())
+            } else {
+                entry.source_name().to_owned()
+            };
         let name = name.as_bytes();
         let name_len =
             u16::try_from(name.len()).map_err(|_| Error::ResourceLimit("ZIP filename bytes"))?;
-        let data = if entry.kind == EntryKind::Directory {
-            &[][..]
-        } else {
-            entry.data.as_slice()
-        };
-        let mut compressed = Vec::new();
         let actual_method = if compression == crate::ZipCompression::Copy {
-            compressed.extend_from_slice(data);
             0
         } else {
-            codec::deflate(data, &mut compressed, false)?;
             8
         };
-        let original_crc = ms_compress::zlib::crc32::crc32(0, data);
-        #[cfg(feature = "crypto")]
-        if let Some((password, random)) = &mut encryption {
-            match mode {
-                crate::ZipEncryption::Aes256 => {
-                    crate::crypto::encrypt(&mut compressed, password, *random)?
-                }
-                crate::ZipEncryption::ZipCrypto => crate::crypto::legacy_encrypt(
-                    &mut compressed,
-                    password,
-                    (original_crc >> 24) as u8,
-                    *random,
-                )?,
-            }
-        }
-        let _ = &mut encryption;
         let encrypted = encryption.is_some();
         let aes = encrypted && mode == crate::ZipEncryption::Aes256;
+        let descriptor = encrypted && !aes;
         let method = if aes { 99 } else { actual_method };
-        let flags = if encrypted { 0x801 } else { 0x800 };
-        let crc = if aes { 0 } else { original_crc };
+        let flags = 0x800 | u16::from(encrypted) | if descriptor { 8 } else { 0 };
         let offset = writer.stream_position()?;
         u32le(writer, 0x04034b50)?;
         u16le(writer, 45)?;
@@ -520,7 +586,7 @@ fn create_impl(
         u16le(writer, method)?;
         u16le(writer, dos_time)?;
         u16le(writer, dos_date)?;
-        u32le(writer, crc)?;
+        u32le(writer, 0)?;
         u32le(writer, u32::MAX)?;
         u32le(writer, u32::MAX)?;
         u16le(writer, name_len)?;
@@ -528,13 +594,47 @@ fn create_impl(
         writer.write_all(name)?;
         u16le(writer, 1)?;
         u16le(writer, 16)?;
-        u64le(writer, data.len() as u64)?;
-        u64le(writer, compressed.len() as u64)?;
+        u64le(writer, entry.source_size())?;
+        u64le(writer, 0)?;
         if aes {
             writer.write_all(&[1, 0x99, 7, 0, 2, 0, b'A', b'E', 3, actual_method as u8, 0])?;
         }
         writer.write_all(&timestamp)?;
-        writer.write_all(&compressed)?;
+        let payload_start = writer.stream_position()?;
+        let original_crc;
+        #[cfg(feature = "crypto")]
+        if let Some((password, random)) = &mut encryption {
+            let mut sink = crate::crypto::EncryptWriter::new(
+                &mut *writer,
+                password,
+                *random,
+                mode,
+                (dos_time >> 8) as u8,
+            )?;
+            original_crc = write_payload(entry, index, open, &mut sink, compression)?;
+            sink.finish()?;
+        } else {
+            original_crc = write_payload(entry, index, open, writer, compression)?;
+        }
+        #[cfg(not(feature = "crypto"))]
+        {
+            original_crc = write_payload(entry, index, open, writer, compression)?;
+        }
+        let _ = &mut encryption;
+        let payload_end = writer.stream_position()?;
+        let compressed_size = payload_end - payload_start;
+        let crc = if aes { 0 } else { original_crc };
+        writer.seek(SeekFrom::Start(offset + 14))?;
+        u32le(writer, crc)?;
+        writer.seek(SeekFrom::Start(offset + 30 + u64::from(name_len) + 12))?;
+        u64le(writer, compressed_size)?;
+        writer.seek(SeekFrom::Start(payload_end))?;
+        if descriptor {
+            u32le(writer, 0x08074b50)?;
+            u32le(writer, crc)?;
+            u64le(writer, compressed_size)?;
+            u64le(writer, entry.source_size())?;
+        }
         u32le(&mut central, 0x02014b50)?;
         u16le(&mut central, if metadata.is_some() { 0x032d } else { 45 })?;
         u16le(&mut central, 45)?;
@@ -553,7 +653,7 @@ fn create_impl(
         u32le(
             &mut central,
             (metadata.and_then(|value| value.unix_mode).unwrap_or(0) << 16)
-                | if entry.kind == EntryKind::Directory {
+                | if entry.source_kind() == EntryKind::Directory {
                     0x10
                 } else {
                     0
@@ -563,8 +663,8 @@ fn create_impl(
         central.write_all(name)?;
         u16le(&mut central, 1)?;
         u16le(&mut central, 24)?;
-        u64le(&mut central, data.len() as u64)?;
-        u64le(&mut central, compressed.len() as u64)?;
+        u64le(&mut central, entry.source_size())?;
+        u64le(&mut central, compressed_size)?;
         u64le(&mut central, offset)?;
         if aes {
             central.write_all(&[1, 0x99, 7, 0, 2, 0, b'A', b'E', 3, actual_method as u8, 0])?;
@@ -597,4 +697,45 @@ fn create_impl(
     u32le(writer, u32::MAX)?;
     u16le(writer, 0)?;
     Ok(())
+}
+
+fn write_payload<'a>(
+    entry: &impl crate::CreationEntry,
+    index: usize,
+    open: &mut impl FnMut(usize) -> Result<Box<dyn Read + 'a>>,
+    writer: &mut impl Write,
+    compression: crate::ZipCompression,
+) -> Result<u32> {
+    let mut source: Box<dyn Read + 'a> = if entry.source_kind() == EntryKind::Directory {
+        Box::new(std::io::empty())
+    } else {
+        open(index)?
+    };
+    let mut crc = 0;
+    let mut copy = |sink: &mut dyn Write| -> Result<()> {
+        let mut remaining = entry.source_size();
+        let mut buffer = [0; 65536];
+        while remaining != 0 {
+            let bound = remaining.min(buffer.len() as u64) as usize;
+            let count = source.read(&mut buffer[..bound])?;
+            if count == 0 {
+                return Err(Error::Malformed("creation source size changed".into()));
+            }
+            remaining -= count as u64;
+            crc = ms_compress::zlib::crc32::crc32(crc, &buffer[..count]);
+            sink.write_all(&buffer[..count])?;
+        }
+        if source.read(&mut [0u8; 1])? != 0 {
+            return Err(Error::Malformed("creation source size changed".into()));
+        }
+        Ok(())
+    };
+    if compression == crate::ZipCompression::Copy {
+        copy(writer)?;
+    } else {
+        let mut compressor = codec::DeflateWriter::new(writer, -15);
+        copy(&mut compressor)?;
+        compressor.finish()?;
+    }
+    Ok(crc)
 }

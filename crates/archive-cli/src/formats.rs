@@ -1,27 +1,7 @@
 use super::*;
 
 pub(crate) fn parse(name: &str) -> archive_core::Result<Format> {
-    match name.to_ascii_lowercase().as_str() {
-        "zip" => Ok(Format::Zip),
-        "tar" => Ok(Format::Tar),
-        "tar.gz" | "tgz" => Ok(Format::TarGzip),
-        "cab" => Ok(Format::Cab),
-        "7z" => Ok(Format::SevenZip),
-        "tar.xz" | "txz" => Ok(Format::TarXz),
-        "xz" => Ok(Format::Xz),
-        "gz" | "gzip" => Ok(Format::Gzip),
-        "zlib" => Ok(Format::Zlib),
-        "lzma" => Ok(Format::Lzma),
-        "deflate" => Ok(Format::Deflate),
-        "bz2" | "bzip2" => Ok(Format::Bzip2),
-        "br" | "brotli" => Ok(Format::Brotli),
-        "tar.bz2" | "tbz2" | "tbz" => Ok(Format::TarBzip2),
-        "tar.br" => Ok(Format::TarBrotli),
-        "iso" => Ok(Format::Iso),
-        _ => Err(archive_core::Error::Unsupported(format!(
-            "unknown format {name:?}"
-        ))),
-    }
+    name.parse()
 }
 
 pub(crate) fn extension(path: &Path) -> Option<Format> {

@@ -17,8 +17,8 @@ borrowed selectors rather than the generic `Archive::open` dispatch.
 | BZip2 / `bzip2` | Standard blocks and concatenated members, CRC checks; explicit TAR wrapper | Pure Rust libbz2-rs backend; level 9; TAR output streams |
 | Brotli / `brotli` | Standard RFC 7932 window; explicit raw/TAR interpretation | Pure Rust rust-brotli, quality 5/window 22; no shared-dictionary or large-window extension claim |
 | XZ / `xz` | Concatenated/multiblock; none/CRC32/CRC64/SHA256 checks; Delta and x86/PPC/IA64/ARM/Thumb/SPARC/ARM64/RISC-V BCJ | LZMA2 with CRC64, optional TAR wrapping; unsupported filter graphs rejected |
-| CAB / `cab` | Stored, MSZIP, LZX, Quantum via cabinet | MSZIP; spanning requires a volume resolver and is rejected by this adapter |
-| 7z / `sevenz` | Direct archive-core parser and ms-compress codec graph; Copy/LZMA/LZMA2, supported filters and AES under `crypto` | Direct writer; independent-folder parallelism under `parallel`; no universal coder/graph claim |
+| CAB / `cab` | Stored, MSZIP, LZX, Quantum via cabinet | Stored, MSZIP, LZX, Quantum; reader-based creation; spanning requires a volume resolver and is rejected by this adapter |
+| 7z / `sevenz` | Direct archive-core parser and ms-compress codec graph; Copy/LZMA/LZMA2/DEFLATE, supported filters and AES under `crypto` | Direct seekable writer streams compressed/encrypted payloads; reader-based creation; independent-folder extraction under `parallel`; no universal coder/graph claim |
 | ISO9660 / `iso` | Portable libmkiso parser adapter | Read only; supported ISO profile only, not a general optical filesystem implementation |
 | UDF / `udf` | Shared libmkiso UDF 1.02–2.60 physical, metadata, VAT and sparable maps; short/long/extended allocations, sparse files, bounded allocation/ICB/file-set chains, embedded data, preallocated tails and backup-anchor recovery | Archive adapter is read only; libmkiso has configurable native UDF authoring. Link metadata retained without following targets; named/system streams exposed separately through explicit stream APIs |
 | WIM/ESD / `wim` | Standalone selected-image/resource adapter | Read only; native validation only, no browser support claim |
@@ -46,16 +46,42 @@ conservative, not exact process RSS accounting. KDF limits apply before costly
 
 Generic indexed reading requires `Read + Seek`. `range::RangeReader` adapts
 caller-owned synchronous range access without networking/runtime dependencies.
-ZIP's `incremental::RangeIndex` and entry decoder bound cached metadata and
-output chunks; this does not make all formats incremental range readers.
-`SequentialTar` works with forward-only input. Indexed TAR.GZ/TAR.XZ retain a
-bounded decoded TAR buffer. `read_entry` retains the whole selected payload;
-streaming extraction does not. Creation consumes the caller's in-memory entry
-payloads even when the output pipeline itself streams.
+ZIP's `incremental::RangeIndex` retains parser progress between range requests,
+prefetches the central directory once, and coalesces local-header reads under
+the metadata cache budget. Its entry decoder bounds output chunks; this does
+not make all formats incremental range readers.
+`SequentialTar` works with forward-only input. Indexed compressed TAR retains a
+bounded decoded TAR buffer unless the caller supplies seekable scratch storage;
+the CLI uses scratch storage. Automatic detection reads a bounded decoded prefix
+and continues the same decoder through complete integrity verification.
+`read_entry` retains the whole selected payload; streaming extraction does not.
+Byte-based creation consumes caller-owned entry payloads. `create_from_readers`
+opens one payload at a time for TAR, TAR.GZ, TAR.XZ, ZIP, 7z, and CAB, including encrypted
+ZIP/7z. The 7z writer sends compressed and encrypted payloads directly to seekable
+output, retaining codec state and bounded metadata rather than the whole packed
+archive. Header encryption also uses the direct output path. Forward-only
+`create_stream_from_readers` supports the three TAR profiles.
+CAB creation uses `ms-cabinet` 0.1.3 reader sources for stored, MSZIP, LZX,
+and Quantum folders. It opens one source at a time and uses a shared 32 KiB
+input frame; compression retains its codec state. Output requires `Write + Seek`.
+
 `inflate_stream` and `deflate_stream` instead accept forward-only `Read` and
 `Write` for raw DEFLATE, gzip and zlib without an in-memory entry payload.
 Raw DEFLATE and Brotli have no payload checksum/authentication; completion and
 size validation are not equivalent to authenticated content.
+
+The portable `MemoryUsage` policy resolves caller-supplied total RAM into a byte
+budget. Automatic defaults follow 7-Zip: 80% for compression and `RAM / 32 * 17`
+(about 53.125%) for decompression, with a 1.75 GiB automatic RAM-base cap on 32-bit
+targets. Native `arc --memuse VALUE` applies this policy; `--mmemuse` and
+`-mmemuse=VALUE` are aliases. Values accept bytes, binary `b/k/m/g/t` suffixes,
+`50%`, or `p50`. `--max-codec-workspace-bytes` and `--max-dictionary-bytes` add
+independent tighter ceilings. Without those overrides, CLI dictionary capacity
+follows the resolved workspace budget. Native worker availability follows the
+OS processor count, and 7z independent-folder scheduling further reduces worker
+count to fit aggregate workspace and pending-output budgets. Portable core and
+browser defaults remain explicit fixed budgets; these controls are not a process
+RSS cap.
 
 Extraction bytes are provisional until final checks succeed. `verified` means
 size and available checksums/authentication passed, not a signature or trusted

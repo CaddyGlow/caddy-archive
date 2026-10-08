@@ -74,6 +74,7 @@ fn preflight(reader: &mut (impl Read + Seek), limits: Limits) -> Result<()> {
     let mut headers = 0u64;
     let mut extensions = 0u64;
     let mut position = 0u64;
+    let mut pax_size = None;
     loop {
         if position == length {
             break;
@@ -90,13 +91,42 @@ fn preflight(reader: &mut (impl Read + Seek), limits: Limits) -> Result<()> {
             return Err(Error::ResourceLimit("TAR headers"));
         }
         let header = tar::Header::from_byte_slice(&raw);
-        let size = header.size()?;
+        let mut size = header.size()?;
         if matches!(raw[156], b'x' | b'g' | b'L' | b'K') {
             extensions = extensions
                 .checked_add(size)
                 .ok_or(Error::ResourceLimit("metadata bytes"))?;
             if extensions > limits.max_metadata_bytes {
                 return Err(Error::ResourceLimit("metadata bytes"));
+            }
+        }
+        // Match the indexer's local PAX size override, including intervening
+        // GNU long-name/link headers. Bound extension allocations before reading.
+        if raw[156] == b'x' && (header.as_ustar().is_some() || header.as_gnu().is_some()) {
+            let length =
+                usize::try_from(size).map_err(|_| Error::ResourceLimit("metadata bytes"))?;
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body)?;
+            pax_size = None;
+            for extension in tar::PaxExtensions::new(&body) {
+                let extension = extension?;
+                if extension.key_bytes() == b"size" {
+                    pax_size = Some(
+                        extension
+                            .value()
+                            .ok()
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .ok_or_else(|| Error::Malformed("PAX size".into()))?,
+                    );
+                    break;
+                }
+            }
+        } else if !matches!(raw[156], b'L' | b'K') {
+            if raw[156] != b'g' {
+                size = pax_size.take().unwrap_or(size);
+            } else {
+                // Global headers are exposed as entries by the indexed TAR reader.
+                pax_size = None;
             }
         }
         position = position

@@ -165,3 +165,18 @@ fn scratch_autodetection_preserves_raw_stream_and_tar_identity() {
             .unwrap();
     assert_eq!(archive.format(), Format::Gzip);
 }
+
+#[test]
+fn zip_comments_may_contain_end_record_signatures() {
+    for comment in [
+        b"PK\x05\x06".as_slice(),
+        b"PK\x05\x06 followed by more than 22 bytes of comment",
+    ] {
+        let mut bytes = fixture(Format::Zip);
+        let end = bytes.len();
+        bytes[end - 2..].copy_from_slice(&(comment.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(comment);
+        let mut archive = Archive::open(Cursor::new(bytes), Limits::default()).unwrap();
+        assert_eq!(archive.test().unwrap().entries, 2);
+    }
+}

@@ -118,3 +118,51 @@ fn failed_inflate_does_not_publish_file() {
     assert!(!output.exists());
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
 }
+
+#[cfg(unix)]
+#[test]
+fn sigint_during_partial_tar_header_exits_instead_of_retrying() {
+    use std::io::{BufRead, BufReader};
+    use std::time::{Duration, Instant};
+    let mut header = [0u8; 512];
+    header[..5].copy_from_slice(b"ready");
+    for range in [100..108, 108..116, 116..124, 124..136, 136..148] {
+        header[range.clone()].fill(b'0');
+        header[range.end - 1] = 0;
+    }
+    header[148..156].fill(b' ');
+    header[156] = b'0';
+    let checksum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+    header[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_arc"))
+        .args(["list", "--format", "tar", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    input.write_all(&header).unwrap();
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert!(line.contains("ready"));
+    input.write_all(b"x").unwrap();
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let _ = input.write_all(b"y");
+    drop(input);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert_eq!(status.code(), Some(130));
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("SIGINT left the TAR reader retrying after EOF");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}

@@ -19,10 +19,8 @@ use std::{
 static CANCELLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 fn check_cancelled() -> io::Result<()> {
     if CANCELLED.load(std::sync::atomic::Ordering::Relaxed) {
-        Err(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "operation cancelled",
-        ))
+        // Interrupted is retried by read_exact/write_all; cancellation is terminal.
+        Err(io::Error::other("operation cancelled"))
     } else {
         Ok(())
     }

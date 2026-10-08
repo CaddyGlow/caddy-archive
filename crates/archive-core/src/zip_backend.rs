@@ -211,7 +211,15 @@ fn preflight(reader: &mut (impl Read + Seek), limits: Limits) -> Result<u64> {
     reader.read_exact(&mut tail)?;
     let eocd = tail
         .windows(4)
-        .rposition(|w| w == b"PK\x05\x06")
+        .enumerate()
+        .rfind(|(offset, signature)| {
+            if *signature != b"PK\x05\x06" || tail.len() - offset < 22 {
+                return false;
+            }
+            let comment = u16::from_le_bytes([tail[offset + 20], tail[offset + 21]]);
+            offset + 22 + usize::from(comment) == tail.len()
+        })
+        .map(|(offset, _)| offset)
         .ok_or_else(|| Error::Malformed("ZIP end record missing".into()))?;
     if tail.len() - eocd < 22 {
         return Err(Error::Malformed("truncated ZIP end record".into()));

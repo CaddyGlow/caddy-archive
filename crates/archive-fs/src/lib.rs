@@ -191,10 +191,8 @@ impl CancellationToken {
     }
     fn check(&self) -> io::Result<()> {
         if self.is_cancelled() {
-            Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "operation cancelled",
-            ))
+            // Interrupted is retried by write_all; cancellation is terminal.
+            Err(io::Error::other("operation cancelled"))
         } else {
             Ok(())
         }
@@ -709,6 +707,12 @@ mod tests {
                 .file_cancellable(b"a", &cancellation, |sink| {
                     sink.write_all(b"partial")?;
                     cancellation.cancel();
+                    // Standard write_all must not retry terminal cancellation.
+                    assert_ne!(
+                        sink.write(b"more").unwrap_err().kind(),
+                        io::ErrorKind::Interrupted
+                    );
+                    sink.write_all(b"more")?;
                     Ok(7)
                 })
                 .is_err()

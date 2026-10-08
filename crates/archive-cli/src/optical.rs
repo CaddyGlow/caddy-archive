@@ -5,20 +5,8 @@ pub(crate) fn operation(
     limits: Limits,
 ) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
     if matches!(cli.view, Some(OpticalView::Udf)) {
-        use std::io::Read;
-        let mut bytes = Vec::new();
-        std::fs::File::open(path)?
-            .take(
-                limits
-                    .max_input_bytes
-                    .checked_add(1)
-                    .ok_or("input limit overflow")?,
-            )
-            .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > limits.max_input_bytes {
-            return Err(archive_core::Error::ResourceLimit("input bytes").into());
-        }
-        let archive = archive_core::udf::UdfArchive::open(&bytes, limits)?;
+        let archive =
+            archive_core::udf::UdfArchive::open_reader(std::fs::File::open(path)?, limits)?;
         let result = match &cli.command {
             Command::List { .. } => {
                 if !cli.json {

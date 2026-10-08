@@ -13,14 +13,15 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
-packages = ["dep:ms-package"]
+packages = ["dep:ms-package", "dep:package-core"]
 crypto = ["archive-core/crypto"]
 sevenz = ["archive-core/sevenz"]
 bzip2 = ["archive-core/bzip2"]
 brotli = ["archive-core/brotli"]
 
 [dependencies]
-archive-core = { version = "0.1.0", package = "caddy-archive-core", path = "../archive-core" }
+package-core = { package = "caddy-archive-core", version = "=0.1.0", default-features = false, optional = true }
+archive-core = { version = "0.2.0", package = "caddy-archive-core", path = "../archive-core" }
 wasm-bindgen = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -1,6 +1,7 @@
 use archive_core::{Archive, CreateEntry, EntryKind, Format, Limits};
 mod formats;
 mod optical;
+mod package_compat;
 #[cfg(feature = "progress")]
 mod render_progress;
 mod single_file;
@@ -97,6 +98,14 @@ struct Cli {
     view: Option<OpticalView>,
     #[arg(short = 'M', long, global = true, default_value_t = 1073741824)]
     max_input_bytes: u64,
+    /// Maximum decoded bytes per entry.
+    #[arg(long, global = true, default_value_t = 8u64 << 30)]
+    max_entry_bytes: u64,
+    /// Maximum total decoded bytes per archive operation.
+    #[arg(long, global = true, default_value_t = 32u64 << 30)]
+    max_total_bytes: u64,
+    #[arg(long, global = true, default_value_t = 100_000)]
+    max_entries: u64,
     #[arg(short = 'P', long, global = true, value_enum, default_value = "auto")]
     progress: Progress,
     #[command(subcommand)]
@@ -370,6 +379,9 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let _ = enabled;
     let limits = Limits {
         max_input_bytes: cli.max_input_bytes,
+        max_entry_bytes: cli.max_entry_bytes,
+        max_total_bytes: cli.max_total_bytes,
+        max_entries: cli.max_entries,
         ..Limits::default()
     };
     let result = match &cli.command {
@@ -661,11 +673,29 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     )
                     .into());
                 }
-                Archive::open_as(std::fs::File::open(path)?, format, limits)?
+                Archive::open_with_scratch(
+                    std::fs::File::open(path)?,
+                    tempfile::tempfile()?,
+                    limits,
+                    Some(format),
+                    None,
+                )?
             } else if let Some(password) = &password {
-                Archive::open_with_password(std::fs::File::open(path)?, limits, &password.0)?
+                Archive::open_with_scratch(
+                    std::fs::File::open(path)?,
+                    tempfile::tempfile()?,
+                    limits,
+                    None,
+                    Some(&password.0),
+                )?
             } else {
-                match Archive::open(std::fs::File::open(path)?, limits) {
+                match Archive::open_with_scratch(
+                    std::fs::File::open(path)?,
+                    tempfile::tempfile()?,
+                    limits,
+                    None,
+                    None,
+                ) {
                     Err(archive_core::Error::Unsupported(message))
                         if message == "unrecognized archive signature" =>
                     {
@@ -676,7 +706,13 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             )
                         });
                         if let Some(format) = hint {
-                            Archive::open_as(std::fs::File::open(path)?, format, limits)?
+                            Archive::open_with_scratch(
+                                std::fs::File::open(path)?,
+                                tempfile::tempfile()?,
+                                limits,
+                                Some(format),
+                                None,
+                            )?
                         } else {
                             return Err(archive_core::Error::Unsupported(
                                 "unrecognized archive signature; specify --format for raw streams"
@@ -1064,6 +1100,9 @@ fn package_operation(
             path,
             Limits {
                 max_input_bytes: cli.max_input_bytes,
+                max_entry_bytes: cli.max_entry_bytes,
+                max_total_bytes: cli.max_total_bytes,
+                max_entries: cli.max_entries,
                 ..Limits::default()
             },
         );
@@ -1093,30 +1132,21 @@ fn package_operation(
     }
     let limits = Limits {
         max_input_bytes: cli.max_input_bytes,
+        max_entry_bytes: cli.max_entry_bytes,
+        max_total_bytes: cli.max_total_bytes,
+        max_entries: cli.max_entries,
         ..Limits::default()
     };
     if let Some(result) = optical::operation(cli, path, limits)? {
         return Ok(Some(result));
     }
     if matches!(extension.as_str(), "wim" | "esd") {
-        use std::io::Read;
-        let mut bytes = Vec::new();
-        std::fs::File::open(path)?
-            .take(
-                limits
-                    .max_input_bytes
-                    .checked_add(1)
-                    .ok_or("input limit overflow")?,
-            )
-            .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > limits.max_input_bytes {
-            return Err(archive_core::Error::ResourceLimit("input bytes").into());
-        }
+        let source = std::fs::File::open(path)?;
         if cli.image.is_none()
             && cli.image_name.is_none()
             && matches!(cli.command, Command::List { .. })
         {
-            let images = archive_core::wim::images(&bytes, limits)?;
+            let images = archive_core::wim::images_reader(source, limits)?;
             if !cli.json {
                 for image in &images {
                     println!("{} {}", image.index, image.name.as_deref().unwrap_or(""));
@@ -1128,10 +1158,10 @@ fn package_operation(
             ));
         }
         let archive = if let Some(name) = &cli.image_name {
-            archive_core::wim::WimArchive::open_by_name(&bytes, name, limits)?
+            archive_core::wim::FileWimArchive::open_reader_by_name(source, name, limits)?
         } else {
-            archive_core::wim::WimArchive::open(
-                &bytes,
+            archive_core::wim::FileWimArchive::open_reader(
+                source,
                 cli.image
                     .ok_or("WIM/ESD requires --image or --image-name")?,
                 limits,
@@ -1208,7 +1238,7 @@ fn package_operation(
     if matches!(extension.as_str(), "appxbundle" | "msixbundle") {
         let mut bundle = ms_package::AppxBundle::open(
             std::fs::File::open(path)?,
-            limits,
+            package_compat::limits(limits),
             limits.max_metadata_bytes,
         )?;
         if let Some(selected) = &cli.bundle_entry {
@@ -1217,7 +1247,7 @@ fn package_operation(
             }
             let mut package = bundle.select(
                 selected,
-                limits,
+                package_compat::limits(limits),
                 limits.max_entry_bytes,
                 limits.max_metadata_bytes,
             )?;
@@ -1250,7 +1280,7 @@ fn package_operation(
     if matches!(extension.as_str(), "appx" | "msix") {
         let mut package = ms_package::AppxPackage::open(
             std::fs::File::open(path)?,
-            limits,
+            package_compat::limits(limits),
             limits.max_metadata_bytes,
         )?;
         return Ok(Some(appx_operation(cli, &mut package, &extension, limits)?));
@@ -1374,15 +1404,20 @@ fn appx_operation<R: io::Read + io::Seek>(
                     eprintln!("{}", entry.name);
                 }
                 match entry.kind {
-                    EntryKind::Directory => {
+                    package_core::EntryKind::Directory => {
                         destination.directory(&entry.raw_name)?;
-                        pending
-                            .directory_metadata(&entry.raw_name, package.entry_metadata(entry.id)?);
+                        pending.directory_metadata(
+                            &entry.raw_name,
+                            package_compat::metadata(package.entry_metadata(entry.id)?),
+                        );
                     }
-                    EntryKind::File => {
+                    package_core::EntryKind::File => {
                         let bytes = package.read_entry(entry.id, limits.max_entry_bytes)?;
                         pending.stage(entry.id.0, &entry.raw_name, entry.size)?;
-                        pending.metadata(entry.id.0, package.entry_metadata(entry.id)?)?;
+                        pending.metadata(
+                            entry.id.0,
+                            package_compat::metadata(package.entry_metadata(entry.id)?),
+                        )?;
                         pending.write(entry.id.0, &bytes)?;
                     }
                     _ => return Err("package links are unsupported".into()),

@@ -88,8 +88,8 @@ drop; this does not clear the source file or copies retained by format backends.
 Native encryption randomness comes from the operating system. AES-256 is the ZIP
 creation default; `--zip-encryption zipcrypto` explicitly selects legacy compatibility.
 
-`--max-input-bytes` defaults to 1 GiB. WIM/ESD and UDF adapters buffer the source up
-to this explicit ceiling. WIM/ESD listing without a selector reports container
+`--max-input-bytes` defaults to 1 GiB. UDF and WIM/ESD use seekable source
+reads and stream extracted file data. WIM/ESD listing without a selector reports container
 images; `--image` is one-based and `--image-name` selects an exact XML name.
 Testing/extraction require one selector, and the two selectors conflict.
 APPX/MSIX bundle listing reports declared nested-package identities. Testing or
@@ -220,3 +220,16 @@ These files contain one raw block, without custom framing, checksums, names,
 or filesystem metadata. Non-DEFLATE codecs use bounded input buffering; large
 files can exceed the workspace limit. Both paths accept `-` for stdin/stdout;
 stdout compression requires `-f` and cannot combine with JSON.
+
+Resource limits apply through global `--max-input-bytes`, `--max-entry-bytes`,
+`--max-total-bytes`, and `--max-entries` options (integer bytes/counts). For
+example, `arc --max-entry-bytes 67108864 --max-total-bytes 268435456
+--max-entries 1000 extract upload.zip --output out` limits entries to 64 MiB
+and total decoded output to 256 MiB. Defaults are 1 GiB input, 8 GiB per entry,
+32 GiB output and 100,000 entries.
+
+Compressed TAR uses temporary-file storage bounded by decoded output limits.
+Library callers choosing in-memory indexing additionally have a 256 MiB
+`Limits::max_buffered_bytes` cap. Neither is a process-wide memory limit.
+Package members, raw block codecs and some creation paths still buffer data;
+see the core README's resource and memory notes.

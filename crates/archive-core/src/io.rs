@@ -1,6 +1,61 @@
 //! Byte range adapters without filesystem, runtime, or whole-input buffering.
 use crate::{Error, Result};
 use std::io::{self, Read, Seek, SeekFrom};
+
+/// Fallible retained-output allocation, checked before extending the buffer.
+#[cfg(any(
+    feature = "gzip",
+    feature = "xz",
+    all(feature = "streams", feature = "tar")
+))]
+pub(crate) struct BoundedBuffer {
+    bytes: Vec<u8>,
+    limit: u64,
+}
+#[cfg(any(
+    feature = "gzip",
+    feature = "xz",
+    all(feature = "streams", feature = "tar")
+))]
+impl BoundedBuffer {
+    pub(crate) fn new(limit: u64) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
+    }
+    pub(crate) fn into_inner(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+#[cfg(any(
+    feature = "gzip",
+    feature = "xz",
+    all(feature = "streams", feature = "tar")
+))]
+impl io::Write for BoundedBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let end = self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .filter(|&end| end as u64 <= self.limit)
+            .ok_or_else(|| error(Error::ResourceLimit("buffered decoded bytes")))?;
+        if end > self.bytes.capacity() {
+            // Grow geometrically, but never request capacity beyond the budget.
+            let capacity =
+                (self.bytes.capacity().saturating_mul(2).max(end) as u64).min(self.limit) as usize;
+            self.bytes
+                .try_reserve_exact(capacity - self.bytes.len())
+                .map_err(|_| error(Error::ResourceLimit("buffered allocation")))?;
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 /// A stable immutable input. Implementations must return at most `output.len()` bytes.
 pub trait RangeSource {
     fn length(&self) -> Result<u64>;

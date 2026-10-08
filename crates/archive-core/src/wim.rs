@@ -1,6 +1,5 @@
-//! Optional borrowed-byte WIM adapter. Images are explicit container selectors.
-//! This initial adapter bounds whole-resource allocations; it is not a range source.
-use std::io::Write;
+//! Seekable WIM adapter with bounded resource reads and chunked extraction.
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
 use crate::{Entry, EntryId, EntryKind, Error, ExtractReport, Limits, Result};
 
@@ -21,10 +20,15 @@ pub struct WimImage {
 
 /// List image identities after bounding XML and lookup-resource allocations.
 pub fn images(bytes: &[u8], limits: Limits) -> Result<Vec<WimImage>> {
-    if bytes.len() as u64 > limits.max_input_bytes {
+    images_reader(Cursor::new(bytes), limits)
+}
+
+/// List images without retaining the source file in memory.
+pub fn images_reader(mut reader: impl Read + Seek, limits: Limits) -> Result<Vec<WimImage>> {
+    if reader.seek(SeekFrom::End(0))? > limits.max_input_bytes {
         return Err(Error::ResourceLimit("input bytes"));
     }
-    let header = wim_format::Header::parse_seekable(bytes).map_err(parse_error)?;
+    let header = wim_format::file_archive::read_header(&mut reader).map_err(parse_error)?;
     if header.total_parts != 1 {
         return Err(Error::Unsupported(
             "split WIM requires explicit part resolver".into(),
@@ -49,8 +53,12 @@ pub fn images(bytes: &[u8], limits: Limits) -> Result<Vec<WimImage>> {
     if u64::from(header.chunk_size) > limits.max_dictionary_bytes {
         return Err(Error::ResourceLimit("WIM decoder workspace"));
     }
-    let archive = wim_format::archive::Archive::open(bytes).map_err(parse_error)?;
-    let xml = archive.xml().map_err(parse_error)?;
+    let xml_bytes = wim_format::file_archive::read_resource(&mut reader, &header, &header.xml_data)
+        .map_err(parse_error)?;
+    let xml = wim_format::xml::XmlInfo::parse_utf16le(&xml_bytes).map_err(parse_error)?;
+    if xml.image_count() != header.image_count as usize {
+        return Err(Error::Malformed("WIM XML image count mismatch".into()));
+    }
     (1..=header.image_count)
         .map(|index| {
             let xml_index = i32::try_from(index).map_err(|_| Error::ResourceLimit("WIM images"))?;
@@ -64,8 +72,11 @@ pub fn images(bytes: &[u8], limits: Limits) -> Result<Vec<WimImage>> {
 }
 
 /// A selected WIM image with caller-retained source bytes.
-pub struct WimArchive<'a> {
-    archive: wim_format::archive::Archive<'a>,
+pub type WimArchive<'a> = FileWimArchive<Cursor<&'a [u8]>>;
+
+/// Selected WIM image backed by seekable input, with bounded payload reads.
+pub struct FileWimArchive<R> {
+    archive: wim_format::file_archive::FileArchive<R>,
     entries: Vec<Entry>,
     hashes: Vec<Option<[u8; 20]>>,
     stored_metadata: Vec<crate::EntryMetadata>,
@@ -73,10 +84,17 @@ pub struct WimArchive<'a> {
     image: u32,
 }
 
-impl<'a> WimArchive<'a> {
-    /// Select exactly one image by its XML name, without numeric-name guessing.
+impl<'a> FileWimArchive<Cursor<&'a [u8]>> {
+    pub fn open(bytes: &'a [u8], image: u32, limits: Limits) -> Result<Self> {
+        Self::open_reader(Cursor::new(bytes), image, limits)
+    }
     pub fn open_by_name(bytes: &'a [u8], name: &str, limits: Limits) -> Result<Self> {
-        let mut matches = images(bytes, limits)?
+        Self::open_reader_by_name(Cursor::new(bytes), name, limits)
+    }
+}
+impl<R: Read + Seek> FileWimArchive<R> {
+    pub fn open_reader_by_name(mut reader: R, name: &str, limits: Limits) -> Result<Self> {
+        let mut matches = images_reader(&mut reader, limits)?
             .into_iter()
             .filter(|image| image.name.as_deref() == Some(name));
         let selected = matches
@@ -85,14 +103,13 @@ impl<'a> WimArchive<'a> {
         if matches.next().is_some() {
             return Err(Error::Malformed("ambiguous WIM image name".into()));
         }
-        Self::open(bytes, selected.index, limits)
+        Self::open_reader(reader, selected.index, limits)
     }
-    /// Open a one-based image, bounding lookup, image metadata and decoder resources.
-    pub fn open(bytes: &'a [u8], image: u32, limits: Limits) -> Result<Self> {
-        if bytes.len() as u64 > limits.max_input_bytes {
+    pub fn open_reader(mut reader: R, image: u32, limits: Limits) -> Result<Self> {
+        if reader.seek(SeekFrom::End(0))? > limits.max_input_bytes {
             return Err(Error::ResourceLimit("input bytes"));
         }
-        let header = wim_format::Header::parse_seekable(bytes).map_err(parse_error)?;
+        let header = wim_format::file_archive::read_header(&mut reader).map_err(parse_error)?;
         if header.total_parts != 1 {
             return Err(Error::Unsupported(
                 "split WIM requires explicit part resolver".into(),
@@ -117,7 +134,8 @@ impl<'a> WimArchive<'a> {
         if u64::from(header.chunk_size) > limits.max_dictionary_bytes {
             return Err(Error::ResourceLimit("WIM decoder workspace"));
         }
-        let archive = wim_format::archive::Archive::open(bytes).map_err(parse_error)?;
+        let archive = wim_format::file_archive::FileArchive::open_with_header(reader, header)
+            .map_err(parse_error)?;
         let metadata_blob = archive
             .lookup
             .metadata
@@ -135,9 +153,9 @@ impl<'a> WimArchive<'a> {
             return Err(Error::ResourceLimit("WIM metadata resource bytes"));
         }
         for resource in &archive.lookup.resources {
-            if resource
-                .uncompressed_size
-                .saturating_add(u64::from(resource.chunk_size))
+            if u64::from(resource.chunk_size)
+                .saturating_mul(3)
+                .saturating_add(65536)
                 > limits.max_active_workspace_bytes
             {
                 return Err(Error::ResourceLimit("WIM active workspace bytes"));
@@ -313,12 +331,60 @@ impl<'a> WimArchive<'a> {
             None => Ok(Vec::new()),
         }
     }
-    /// Deliver bytes only after their WIM blob hash has verified.
+    /// Stream bounded ranges and verify the whole blob's SHA-1 at completion.
+    /// Bytes are provisional until success, as with other archive backends.
     pub fn extract(&self, id: EntryId, output: &mut impl Write) -> Result<ExtractReport> {
-        let bytes = self.read_entry(id, self.limits.max_entry_bytes)?;
-        output.write_all(&bytes)?;
+        use sha1::{Digest, Sha1};
+        let entry = self
+            .entries
+            .get(id.0)
+            .ok_or_else(|| Error::Malformed("unknown WIM entry ID".into()))?;
+        if !matches!(entry.kind, EntryKind::File | EntryKind::Directory) {
+            return Err(Error::Unsupported(
+                "WIM links, encrypted raw streams and special files".into(),
+            ));
+        }
+        if let Some(hash) = self.hashes[id.0] {
+            let blob = self
+                .archive
+                .lookup
+                .find(&hash)
+                .ok_or_else(|| Error::Malformed("missing WIM file blob".into()))?;
+            let resource = &self.archive.lookup.resources[blob.resource_index];
+            let chunk = if resource.chunk_size == 0 {
+                65536
+            } else {
+                u64::from(resource.chunk_size)
+            };
+            let mut digest = Sha1::new();
+            let mut offset = 0;
+            while offset < entry.size {
+                // Align reads to physical decoded chunks, including solid blob
+                // offsets, so a large chunk is not decoded once per 64 KiB slice.
+                let position = blob
+                    .offset
+                    .checked_add(offset)
+                    .ok_or(Error::ResourceLimit("WIM blob offset"))?;
+                let end = offset
+                    .saturating_add(chunk - position % chunk)
+                    .min(entry.size);
+                let bytes = self
+                    .archive
+                    .read_blob_range(&hash, offset..end)
+                    .map_err(parse_error)?;
+                if bytes.len() as u64 != end - offset {
+                    return Err(Error::Integrity("WIM blob range size mismatch".into()));
+                }
+                digest.update(&bytes);
+                output.write_all(&bytes)?;
+                offset = end;
+            }
+            if digest.finalize().as_slice() != hash {
+                return Err(Error::Integrity("WIM blob SHA-1 mismatch".into()));
+            }
+        }
         Ok(ExtractReport {
-            bytes: bytes.len() as u64,
+            bytes: entry.size,
             entries: 1,
             verified: true,
         })

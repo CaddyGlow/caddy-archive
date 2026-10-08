@@ -338,11 +338,11 @@ impl BytePackage {
         if bytes.len() as u64 > maximum {
             return Err(JsValue::from_str("package input limit exceeded"));
         }
-        let limits = Limits {
+        let limits = package_core::Limits {
             max_input_bytes: maximum,
             max_entry_bytes: maximum,
             max_total_bytes: maximum,
-            ..Limits::default()
+            ..package_core::Limits::default()
         };
         let package = ms_package::AppxPackage::open(
             Cursor::new(bytes.to_vec()),
@@ -376,7 +376,7 @@ impl BytePackage {
     pub fn read_entry(&mut self, id: usize, maximum: u64) -> Result<Vec<u8>, JsValue> {
         self.validate()?;
         self.package
-            .read_entry(EntryId(id), maximum.min(self.maximum))
+            .read_entry(package_core::EntryId(id), maximum.min(self.maximum))
             .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 }
@@ -398,11 +398,11 @@ impl ByteBundle {
         if bytes.len() as u64 > maximum {
             return Err(JsValue::from_str("bundle input limit exceeded"));
         }
-        let limits = Limits {
+        let limits = package_core::Limits {
             max_input_bytes: maximum,
             max_entry_bytes: maximum,
             max_total_bytes: maximum,
-            ..Limits::default()
+            ..package_core::Limits::default()
         };
         let bundle = ms_package::AppxBundle::open(
             Cursor::new(bytes.to_vec()),
@@ -441,11 +441,11 @@ impl ByteBundle {
     pub fn select(&mut self, file_name: &str, maximum: u64) -> Result<BytePackage, JsValue> {
         self.validate()?;
         let maximum = maximum.min(self.maximum);
-        let limits = Limits {
+        let limits = package_core::Limits {
             max_input_bytes: maximum,
             max_entry_bytes: maximum,
             max_total_bytes: maximum,
-            ..Limits::default()
+            ..package_core::Limits::default()
         };
         let package = self
             .bundle

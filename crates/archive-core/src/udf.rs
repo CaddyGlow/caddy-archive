@@ -1,7 +1,29 @@
 //! UDF archive adapter with separate main namespace and associated streams.
 use crate::{Entry, EntryId, EntryKind, Error, ExtractReport, Limits, Result};
 use libmkiso::udf;
-use std::io::Write;
+use std::{
+    cell::RefCell,
+    io::{Read, Seek, SeekFrom, Write},
+};
+
+struct SeekSource<R> {
+    reader: RefCell<R>,
+    length: u64,
+}
+impl<R: Read + Seek> libmkiso::source::ReadAt for SeekSource<R> {
+    fn len(&self) -> u64 {
+        self.length
+    }
+    fn read_at(&self, offset: u64, bytes: &mut [u8]) -> std::io::Result<usize> {
+        if offset >= self.length {
+            return Ok(0);
+        }
+        let count = (self.length - offset).min(bytes.len() as u64) as usize;
+        let mut reader = self.reader.borrow_mut();
+        reader.seek(SeekFrom::Start(offset))?;
+        reader.read(&mut bytes[..count])
+    }
+}
 
 fn map_error(error: udf::Error) -> Error {
     match error {
@@ -23,8 +45,17 @@ pub struct UdfArchive<'a> {
 impl<'a> UdfArchive<'a> {
     /// Parse supported UDF 1.02–2.60 profiles, including associated streams.
     pub fn open(bytes: &'a [u8], limits: Limits) -> Result<Self> {
-        let reader = udf::UdfReader::open(
-            bytes,
+        Self::open_reader(std::io::Cursor::new(bytes), limits)
+    }
+    /// Open immutable seekable input without retaining the complete image.
+    /// The caller must keep source bytes stable until the archive is dropped.
+    pub fn open_reader<R: Read + Seek + 'a>(mut reader: R, limits: Limits) -> Result<Self> {
+        let length = reader.seek(SeekFrom::End(0))?;
+        let reader = udf::UdfReader::open_source(
+            SeekSource {
+                reader: RefCell::new(reader),
+                length,
+            },
             udf::Limits {
                 max_entries: limits.max_entries,
                 max_metadata_bytes: limits.max_metadata_bytes,

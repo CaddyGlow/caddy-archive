@@ -102,6 +102,22 @@ pub(crate) fn index<R: Read + Seek>(
         });
     }
     let mut reader = zip.into_inner();
+    // Include local headers in the ranges: a member hidden inside another
+    // member's payload is also an overlapping ZIP bomb.
+    let mut ranges: Vec<_> = locations
+        .iter()
+        .map(|location| {
+            let end = location
+                .offset
+                .checked_add(location.compressed)
+                .ok_or_else(|| Error::Malformed("ZIP payload range overflow".into()))?;
+            Ok((location.header, end))
+        })
+        .collect::<Result<_>>()?;
+    ranges.sort_unstable();
+    if ranges.windows(2).any(|pair| pair[1].0 < pair[0].1) {
+        return Err(Error::Malformed("overlapping ZIP members".into()));
+    }
     let length = reader.seek(SeekFrom::End(0))?;
     for (location, entry) in locations.iter().zip(&entries) {
         if location

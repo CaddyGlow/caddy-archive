@@ -96,3 +96,31 @@ fn always_progress_without_feature_has_clear_error() {
             .contains("progress rendering unavailable")
     );
 }
+
+#[test]
+fn decoded_budget_rejects_bomb_without_publication() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("bomb.zip");
+    archive_core::create(
+        archive_core::Format::Zip,
+        &[archive_core::CreateEntry {
+            name: "zeros".into(),
+            data: vec![0; 128 * 1024],
+            kind: archive_core::EntryKind::File,
+        }],
+        &mut std::fs::File::create(&path).unwrap(),
+        archive_core::Limits::default(),
+    )
+    .unwrap();
+    let destination = root.path().join("out");
+    let result = Command::new(env!("CARGO_BIN_EXE_arc"))
+        .args(["--max-total-bytes", "1024", "extract"])
+        .arg(path)
+        .arg("--output")
+        .arg(&destination)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(!destination.join("zeros").exists());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("limit"));
+}

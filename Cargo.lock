@@ -174,9 +174,10 @@ dependencies = [
 
 [[package]]
 name = "caddy-archive-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
- "caddy-archive-core",
+ "caddy-archive-core 0.1.0",
+ "caddy-archive-core 0.2.0",
  "caddy-archive-fs",
  "clap",
  "indicatif",
@@ -190,6 +191,23 @@ dependencies = [
 [[package]]
 name = "caddy-archive-core"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75e1b98febaa9521589f141b706fa21b42a64a2b30bad3312231093f1cacd416"
+dependencies = [
+ "crc64fast",
+ "libmkiso",
+ "ms-cabinet",
+ "ms-compress",
+ "serde",
+ "sha2",
+ "tar",
+ "thiserror",
+ "zip",
+]
+
+[[package]]
+name = "caddy-archive-core"
+version = "0.2.0"
 dependencies = [
  "aes",
  "brotli",
@@ -216,18 +234,19 @@ dependencies = [
 
 [[package]]
 name = "caddy-archive-fs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
- "caddy-archive-core",
+ "caddy-archive-core 0.2.0",
  "libc",
  "tempfile",
 ]
 
 [[package]]
 name = "caddy-archive-wasm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
- "caddy-archive-core",
+ "caddy-archive-core 0.1.0",
+ "caddy-archive-core 0.2.0",
  "ms-package",
  "serde",
  "serde_json",
@@ -636,7 +655,9 @@ checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
 
 [[package]]
 name = "libmkiso"
-version = "0.1.0"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd33c7015ccbe611f686f84f27aa6baa8d075eed8ed26edde55460f72eee54d9"
 dependencies = [
  "anyhow",
  "hex",
@@ -670,6 +691,8 @@ dependencies = [
 [[package]]
 name = "ms-cabinet"
 version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17cfbe537ecc5b9642100014b72880f5a2942b8718bea46d758ff9348355272d"
 dependencies = [
  "flate2",
  "ms-compress",
@@ -679,6 +702,8 @@ dependencies = [
 [[package]]
 name = "ms-compress"
 version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a171863591b764e540b4dabd5a73fe89b5380826d92ac4d02d1612ed12812ea"
 dependencies = [
  "ms-compress-ruzstd",
 ]
@@ -692,9 +717,11 @@ checksum = "e3713af486ad3232ebd7bf988bbece755be1dd6848cef701038ada611b88a532"
 [[package]]
 name = "ms-package"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50eccfa0cb7011773309afe7ae994ad199ac9b2e1ca242b921e803b5936960bc"
 dependencies = [
  "base64",
- "caddy-archive-core",
+ "caddy-archive-core 0.1.0",
  "caddy-msi",
  "cfb",
  "quick-xml",
@@ -1064,6 +1091,8 @@ dependencies = [
 [[package]]
 name = "wim-format"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41e970065dff3d535952afff245c7a30230e0826eb09cb9997e4f2c7e3cf38e9"
 dependencies = [
  "hashbrown 0.15.5",
  "ms-compress",
@@ -1074,6 +1103,8 @@ dependencies = [
 [[package]]
 name = "wim-types"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9023164dbbb5692eefe79e1438187fe9b19f6348f5f10e977cc32566ac564f92"
 
 [[package]]
 name = "windows-link"

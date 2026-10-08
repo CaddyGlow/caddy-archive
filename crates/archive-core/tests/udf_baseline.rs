@@ -56,3 +56,47 @@ fn udf_descriptor_corruption_and_metadata_budget_are_rejected() {
     }
     assert!(UdfArchive::open(&bytes, Limits::default()).is_err());
 }
+
+#[test]
+fn seekable_udf_matches_borrowed_input_without_whole_image_read() {
+    use std::{
+        cell::Cell,
+        io::{self, Read, Seek, SeekFrom},
+        rc::Rc,
+    };
+    struct Counted {
+        file: std::fs::File,
+        count: Rc<Cell<usize>>,
+    }
+    impl Read for Counted {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            let n = self.file.read(bytes)?;
+            self.count.set(self.count.get() + n);
+            Ok(n)
+        }
+    }
+    impl Seek for Counted {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            self.file.seek(position)
+        }
+    }
+    let (directory, bytes) = fixture();
+    let count = Rc::new(Cell::new(0));
+    let source = Counted {
+        file: std::fs::File::open(directory.path().join("media.iso")).unwrap(),
+        count: count.clone(),
+    };
+    let archive = UdfArchive::open_reader(source, Limits::default()).unwrap();
+    let file = archive
+        .entries()
+        .iter()
+        .find(|entry| entry.name == "payload.txt")
+        .unwrap();
+    assert_eq!(archive.read_entry(file.id, 100).unwrap(), b"UDF payload");
+    assert!(
+        count.get() < bytes.len(),
+        "read {} of {} bytes",
+        count.get(),
+        bytes.len()
+    );
+}

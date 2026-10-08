@@ -88,3 +88,56 @@ fn xml_image_listing_and_exact_name_selection_agree() {
         .is_err()
     );
 }
+
+#[test]
+fn seekable_wim_does_not_read_whole_input_or_emit_whole_file() {
+    use std::{
+        cell::Cell,
+        io::{self, Cursor, Read, Seek, SeekFrom, Write},
+        rc::Rc,
+    };
+    struct Counted {
+        source: Cursor<Vec<u8>>,
+        count: Rc<Cell<usize>>,
+    }
+    impl Read for Counted {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            let n = self.source.read(bytes)?;
+            self.count.set(self.count.get() + n);
+            Ok(n)
+        }
+    }
+    impl Seek for Counted {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            self.source.seek(position)
+        }
+    }
+    struct Sink(usize);
+    impl Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            assert!(bytes.len() <= 65536);
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut bytes =
+        include_bytes!("../../../../wim-rs/crates/wim-format/tests/fixtures/xpress-resource.wim")
+            .to_vec();
+    bytes.resize(4 << 20, 0);
+    let count = Rc::new(Cell::new(0));
+    let reader = Counted {
+        source: Cursor::new(bytes),
+        count: count.clone(),
+    };
+    let archive =
+        archive_core::wim::FileWimArchive::open_reader(reader, 1, Limits::default()).unwrap();
+    let mut sink = Sink(0);
+    for entry in archive.entries() {
+        archive.extract(entry.id, &mut sink).unwrap();
+    }
+    assert_eq!(sink.0, 76810);
+    assert!(count.get() < 1 << 20, "read {} bytes", count.get());
+}

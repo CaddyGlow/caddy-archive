@@ -191,6 +191,9 @@ pub enum EntryFormatMetadata {
 }
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
+    /// Maximum decoded TAR bytes retained by the indexed compressed-TAR API.
+    /// Separate from decoder workspace; this is not a process-wide memory cap.
+    pub max_buffered_bytes: u64,
     pub max_entries: u64,
     pub max_metadata_bytes: u64,
     pub max_entry_bytes: u64,
@@ -206,6 +209,7 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
+            max_buffered_bytes: 256 << 20,
             max_entries: 100_000,
             max_metadata_bytes: 16 << 20,
             max_entry_bytes: 8 << 30,
@@ -358,6 +362,124 @@ pub struct Archive<R> {
     password: Option<zeroize::Zeroizing<Vec<u8>>>,
 }
 impl<R: Read + Seek> Archive<R> {
+    /// Open with caller-owned seekable scratch storage for decoded compressed TAR.
+    /// Supply an empty temporary file to avoid retaining the decoded TAR in RAM.
+    /// Scratch is provisional, must start empty, and is owned by the returned
+    /// archive when used. Output limits still bound the spool's disk consumption.
+    /// Other formats use their normal backend (including its memory policy).
+    pub fn open_with_scratch(
+        mut reader: R,
+        mut scratch: R,
+        limits: Limits,
+        requested: Option<Format>,
+        password: Option<&[u8]>,
+    ) -> Result<Self>
+    where
+        R: Write,
+    {
+        if scratch.seek(SeekFrom::End(0))? != 0 {
+            return Err(Error::Malformed("scratch storage must be empty".into()));
+        }
+        let length = reader.seek(SeekFrom::End(0))?;
+        if length > limits.max_input_bytes {
+            return Err(Error::ResourceLimit("input bytes"));
+        }
+        reader.rewind()?;
+        let mut signature = [0; 512];
+        let count = length.min(signature.len() as u64) as usize;
+        reader.read_exact(&mut signature[..count])?;
+        reader.rewind()?;
+        let detected = probe(&signature[..count]).ok();
+        let format = requested.or(detected);
+        #[cfg(any(
+            feature = "gzip",
+            feature = "xz",
+            all(feature = "streams", feature = "tar")
+        ))]
+        {
+            let tar_format = match format {
+                #[cfg(feature = "gzip")]
+                Some(Format::Gzip | Format::TarGzip) => Some(Format::TarGzip),
+                #[cfg(feature = "xz")]
+                Some(Format::Xz | Format::TarXz) => Some(Format::TarXz),
+                #[cfg(all(feature = "streams", feature = "tar"))]
+                Some(Format::Bzip2 | Format::TarBzip2) => Some(Format::TarBzip2),
+                #[cfg(all(feature = "streams", feature = "tar"))]
+                Some(Format::TarBrotli) => Some(Format::TarBrotli),
+                _ => None,
+            };
+            if let Some(tar_format) = tar_format {
+                let explicit_tar = requested == Some(tar_format);
+                if explicit_tar || requested.is_none() {
+                    fn decode<R: Read + Seek>(
+                        reader: &mut R,
+                        writer: &mut impl Write,
+                        format: Format,
+                        limits: Limits,
+                    ) -> Result<u64> {
+                        match format {
+                            #[cfg(feature = "xz")]
+                            Format::TarXz => xz_backend::decode(reader, writer, limits),
+                            #[cfg(feature = "gzip")]
+                            Format::TarGzip => {
+                                stream_backend::decode(reader, writer, Format::Gzip, limits)
+                            }
+                            #[cfg(all(feature = "streams", feature = "tar"))]
+                            Format::TarBzip2 => {
+                                stream_backend::decode(reader, writer, Format::Bzip2, limits)
+                            }
+                            #[cfg(all(feature = "streams", feature = "tar"))]
+                            Format::TarBrotli => {
+                                stream_backend::decode(reader, writer, Format::Brotli, limits)
+                            }
+                            _ => Err(Error::Unsupported("compressed TAR codec".into())),
+                        }
+                    }
+                    let mut prefix = Prefix::default();
+                    if explicit_tar || {
+                        decode(&mut reader, &mut prefix, tar_format, limits)?;
+                        probe(&prefix.bytes).ok() == Some(Format::Tar)
+                    } {
+                        if password.is_some() {
+                            return Err(Error::Unsupported("compressed TAR encryption".into()));
+                        }
+                        let decoded = decode(&mut reader, &mut scratch, tar_format, limits)?;
+                        scratch.flush()?;
+                        scratch.rewind()?;
+                        let mut archive = Self::open_inner(
+                            scratch,
+                            Limits {
+                                max_input_bytes: decoded,
+                                ..limits
+                            },
+                            None,
+                            Some(Format::Tar),
+                        )?;
+                        archive.limits = limits;
+                        archive.format = tar_format;
+                        archive.detected_format = detected;
+                        #[cfg(any(feature = "gzip", feature = "streams"))]
+                        if tar_format == Format::TarGzip {
+                            archive.gzip_header =
+                                Some(stream_backend::gzip_header(&mut reader, limits)?);
+                        }
+                        return Ok(archive);
+                    }
+                }
+            }
+        }
+        let _ = format;
+        if let Some(password) = password {
+            if requested.is_some() {
+                return Err(Error::Unsupported(
+                    "explicit interpretation with password".into(),
+                ));
+            }
+            Self::open_with_password(reader, limits, password)
+        } else {
+            Self::open_inner(reader, limits, None, requested)
+        }
+    }
     pub fn open(reader: R, limits: Limits) -> Result<Self> {
         Self::open_inner(reader, limits, None, None)
     }
@@ -426,8 +548,9 @@ impl<R: Read + Seek> Archive<R> {
                     && (requested == Some(Format::TarGzip)
                         || probe(&prefix.bytes).ok() == Some(Format::Tar))
                 {
-                    let mut bytes = Vec::new();
+                    let mut bytes = crate::range::BoundedBuffer::new(limits.max_buffered_bytes);
                     stream_backend::decode(&mut reader, &mut bytes, Format::Gzip, limits)?;
+                    let bytes = bytes.into_inner();
                     let (e, l) = tar_backend::index(&mut io::Cursor::new(&bytes), limits)?;
                     format = Format::TarGzip;
                     validate_index(&e, limits)?;
@@ -494,8 +617,9 @@ impl<R: Read + Seek> Archive<R> {
                         } else {
                             Format::Brotli
                         };
-                        let mut bytes = Vec::new();
+                        let mut bytes = crate::range::BoundedBuffer::new(limits.max_buffered_bytes);
                         stream_backend::decode(&mut reader, &mut bytes, raw, limits)?;
+                        let bytes = bytes.into_inner();
                         let (entries, locations) =
                             tar_backend::index(&mut io::Cursor::new(&bytes), limits)?;
                         (Backend::CompressedTar(bytes, locations), entries)
@@ -551,8 +675,9 @@ impl<R: Read + Seek> Archive<R> {
                     && (requested == Some(Format::TarXz)
                         || probe(&prefix.bytes).ok() == Some(Format::Tar))
                 {
-                    let mut decoded = Vec::new();
+                    let mut decoded = crate::range::BoundedBuffer::new(limits.max_buffered_bytes);
                     xz_backend::decode(&mut reader, &mut decoded, limits)?;
+                    let decoded = decoded.into_inner();
                     let (e, l) = tar_backend::index(&mut io::Cursor::new(&decoded), limits)?;
                     format = Format::TarXz;
                     (Backend::TarXz(decoded, l), e)

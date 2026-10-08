@@ -4,6 +4,7 @@ use std::io::Cursor;
 
 fn limits() -> Limits {
     Limits {
+        max_buffered_bytes: 2 << 20,
         max_entries: 128,
         max_metadata_bytes: 1 << 20,
         max_entry_bytes: 1 << 20,
@@ -47,9 +48,23 @@ pub fn package(data: &[u8]) {
     if data.len() > 1 << 20 {
         return;
     }
-    if let Ok(mut package) =
-        ms_package::AppxPackage::open(Cursor::new(data), limits(), 1 << 20)
-    {
+    if let Ok(mut package) = ms_package::AppxPackage::open(
+        Cursor::new(data),
+        package_core::Limits {
+            max_entries: 128,
+            max_metadata_bytes: 1 << 20,
+            max_entry_bytes: 1 << 20,
+            max_total_bytes: 2 << 20,
+            max_dictionary_bytes: 32 << 20,
+            max_input_bytes: 1 << 20,
+            max_active_workspace_bytes: 96 << 20,
+            max_pending_output_bytes: 1 << 20,
+            max_password_iterations: 1024,
+            max_nesting_depth: 16,
+            max_workers: 1,
+        },
+        1 << 20,
+    ) {
         let _ = package.validate(2 << 20);
     }
     if let Ok(mut package) =

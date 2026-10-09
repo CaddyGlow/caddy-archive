@@ -125,6 +125,53 @@ self.onmessage = async () => {
       const decoded = installer.read_file(files[0].id, 1024n * 1024n);
       assert(JSON.stringify([...decoded]) === JSON.stringify(expected.msi.payload_bytes), 'MSI native parity');
     } finally { installer.free(); }
+    stage = 'msi-media-migration';
+    const migrationResponse = await fetch('./pkg/fixtures/media-migration/manifest.json');
+    assert(migrationResponse.ok, 'media fixture manifest');
+    const migration = await migrationResponse.json();
+    function rejects(operation, message) {
+      let failed = false;
+      try {operation();} catch (_) {failed = true;}
+      assert(failed, message);
+    }
+    async function fixture(path) {
+      const response = await fetch(`./pkg/fixtures/media-migration/${path}`);
+      assert(response.ok, `media fixture ${path}`);
+      return new Uint8Array(await response.arrayBuffer());
+    }
+    for (const [profile, declaration] of Object.entries(migration.profiles)) {
+      const bytes = await fixture(declaration.msi);
+      const reader = new ByteInstaller(bytes, 1024n * 1024n, 1000);
+      try {
+        const files = JSON.parse(reader.files_json());
+        assert(files.length === declaration.files.length, `${profile} file count`);
+        const callerOwned = declaration.files.find(file => file.cabinet === null || !file.cabinet.startsWith('#'));
+        if (callerOwned) {
+          rejects(() => reader.read_file(callerOwned.id, 1024n * 1024n), `${profile} missing media`);
+          reader.provide_media('wrong-name', new Uint8Array([0]));
+          rejects(() => reader.read_file(callerOwned.id, 1024n * 1024n), `${profile} exact media names`);
+          reader.clear_media();
+        }
+        for (const media of declaration.media) {
+          const supplied = await fixture(media.artifact);
+          reader.provide_media(media.name, supplied);
+          rejects(() => reader.provide_media(media.name, supplied), `${profile} duplicate media`);
+        }
+        for (const expectedFile of declaration.files) {
+          const file = files.find(file => file.id === expectedFile.id);
+          assert(file && file.path === expectedFile.path && file.size === expectedFile.size && file.cabinet === expectedFile.cabinet, `${profile} unchanged file fields`);
+          assert(file.source_path === expectedFile.source_path, `${profile} explicit source path`);
+          const decoded = reader.read_file(file.id, 1024n * 1024n);
+          const hex = [...decoded].map(byte => byte.toString(16).padStart(2,'0')).join('');
+          assert(hex === expectedFile.payload_hex, `${profile} payload bytes`);
+          if (decoded.length > 1) rejects(() => reader.read_file(file.id, 1n), `${profile} read budget`);
+        }
+        rejects(() => reader.provide_media('', new Uint8Array()), 'empty media name');
+        rejects(() => reader.provide_media('oversized', new Uint8Array(1024 * 1024 + 1)), 'aggregate media budget');
+        reader.clear_media();
+        if (callerOwned) rejects(() => reader.read_file(callerOwned.id, 1024n * 1024n), `${profile} clear media`);
+      } finally {reader.free();}
+    }
     const password = new TextEncoder().encode('browser-fixture-password');
     const encrypted = create_encrypted_file('secret.txt', payload, password, 1024n * 1024n);
     const second = create_encrypted_file('secret.txt', payload, password, 1024n * 1024n);
@@ -283,7 +330,7 @@ self.onmessage = async () => {
       } catch (error) { cancelled = error.name === 'AbortError'; }
       assert(cancelled && cancelledBytes < largePayload.length, 'huge-entry cooperative cancellation');
     } finally { rangeArchive.index.free(); }
-    self.postMessage({ok: true, profiles, packages: ['msix', 'msixbundle', 'msi'], encryption: ['zip-aes256', '7z-aes256-headers'], incremental: 'zip-blob-16MiB-cancellation', editing: ['zip-rename-delete-packed-ciphertext', 'zip-7z-timestamp-encrypt-rekey-decrypt'], worker: true});
+    self.postMessage({ok: true, profiles, packages: ['msix', 'msixbundle', 'msi'], msi_media: Object.keys(migration.profiles), encryption: ['zip-aes256', '7z-aes256-headers'], incremental: 'zip-blob-16MiB-cancellation', editing: ['zip-rename-delete-packed-ciphertext', 'zip-7z-timestamp-encrypt-rekey-decrypt'], worker: true});
   } catch (error) {
     self.postMessage({ok: false, stage, error: String(error)});
   }

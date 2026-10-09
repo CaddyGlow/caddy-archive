@@ -54,3 +54,9 @@ tests. The workflow publishes core/fs in dependency order, verifies standalone
 source and crate packages, then publishes CLI/WASM and creates the GitHub Release.
 Already published versions are skipped. Manual Release dispatch remains available
 to bootstrap core/fs independently.
+
+MSI media integration uses published `ms-package` 0.2.2 with `caddy-msi` 0.10.2.
+The CLI and Worker accept explicit media bytes/paths for embedded, external,
+loose, partitioned and mixed layouts. Published package types use the separately
+aliased registry `caddy-archive-core` 0.2.1; workspace archive types keep their
+path identity. See the [migration record](docs/msi-media-refactoring-plan.md).

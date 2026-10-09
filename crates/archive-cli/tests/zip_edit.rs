@@ -7,6 +7,11 @@ use std::{
     process::{Command, Output},
 };
 
+fn tempdir() -> tempfile::TempDir {
+    // Use an admitted physical path when the platform temporary root is an alias.
+    tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap()
+}
+
 fn command(args: &[&str], archive: &Path) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_arc"));
     command.args(["--json", args[0]]).arg(archive);
@@ -85,7 +90,7 @@ fn packed(bytes: &[u8]) -> &[u8] {
 
 #[test]
 fn encrypted_rename_reuses_ciphertext_without_credentials_and_extracts_independently() {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempdir();
     let input = root.path().join("input");
     std::fs::create_dir(&input).unwrap();
     std::fs::write(input.join("payload"), b"secret content").unwrap();
@@ -134,7 +139,7 @@ fn encrypted_rename_reuses_ciphertext_without_credentials_and_extracts_independe
 
 #[test]
 fn directory_delete_respects_path_boundaries_and_can_verify_remaining_payloads() {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempdir();
     let archive = root.path().join("archive.zip");
     fixture(&archive, &["dir/", "dir/a", "dir/sub/b", "dir2/a"]);
     let deleted = command(&["delete", "dir/", "--verify"], &archive);
@@ -148,7 +153,7 @@ fn directory_delete_respects_path_boundaries_and_can_verify_remaining_payloads()
 
 #[test]
 fn dry_run_has_decisions_and_collisions_preserve_original() {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempdir();
     let archive = root.path().join("archive.zip");
     fixture(&archive, &["a", "b"]);
     let original = std::fs::read(&archive).unwrap();
@@ -165,7 +170,7 @@ fn dry_run_has_decisions_and_collisions_preserve_original() {
 
 #[test]
 fn output_alias_and_existing_output_are_rejected() {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempdir();
     let archive = root.path().join("archive.zip");
     fixture(&archive, &["a"]);
     let original = std::fs::read(&archive).unwrap();
@@ -189,7 +194,7 @@ fn output_alias_and_existing_output_are_rejected() {
 
 #[test]
 fn new_output_leaves_original_byte_identical() {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempdir();
     let archive = root.path().join("archive.zip");
     fixture(&archive, &["a", "b"]);
     let original = std::fs::read(&archive).unwrap();
@@ -208,7 +213,7 @@ fn new_output_leaves_original_byte_identical() {
 
 #[test]
 fn unsupported_extra_field_is_rejected_before_creating_output() {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempdir();
     let archive = root.path().join("archive.zip");
     fixture(&archive, &["a"]);
     let mut bytes = std::fs::read(&archive).unwrap();
@@ -242,7 +247,7 @@ fn unsupported_extra_field_is_rejected_before_creating_output() {
 
 #[test]
 fn verification_failure_preserves_encrypted_original() {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempdir();
     let input = root.path().join("input");
     std::fs::create_dir(&input).unwrap();
     std::fs::write(input.join("a"), b"secret").unwrap();
@@ -274,7 +279,7 @@ fn generic_zip_edits_refuse_package_markers() {
         "AppxMetadata/AppxBundleManifest.xml",
         "META-INF/SIGNER.RSA",
     ] {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempdir();
         let archive = root.path().join("archive.zip");
         fixture(&archive, &[marker, "payload"]);
         let original = std::fs::read(&archive).unwrap();
@@ -287,7 +292,7 @@ fn generic_zip_edits_refuse_package_markers() {
 
 #[test]
 fn irrelevant_effective_options_are_rejected_before_source_io() {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempdir();
     let missing = root.path().join("missing.zip");
     for options in [
         vec!["--password-file", "missing-password"],

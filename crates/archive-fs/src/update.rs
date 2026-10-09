@@ -261,9 +261,14 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
 
+    fn tempdir() -> tempfile::TempDir {
+        // Keep tests independent of macOS /var and other temporary-root aliases.
+        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap()
+    }
+
     #[test]
     fn replacement_publishes_finished_output_and_retains_original_reader() {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempdir();
         let path = root.path().join("archive");
         std::fs::write(&path, b"original").unwrap();
         let mut transaction = UpdateTransaction::replace(&path).unwrap();
@@ -289,7 +294,7 @@ mod tests {
     #[test]
     fn cancellation_at_each_publication_checkpoint_preserves_original() {
         for cancel_at in [1, 2] {
-            let root = tempfile::tempdir().unwrap();
+            let root = tempdir();
             let path = root.path().join("archive");
             std::fs::write(&path, b"original").unwrap();
             let mut transaction = UpdateTransaction::replace(&path).unwrap();
@@ -314,7 +319,7 @@ mod tests {
 
     #[test]
     fn concurrent_replacement_is_detected_and_preserved() {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempdir();
         let path = root.path().join("archive");
         std::fs::write(&path, b"original").unwrap();
         let transaction = UpdateTransaction::replace(&path).unwrap();
@@ -327,7 +332,7 @@ mod tests {
 
     #[test]
     fn source_in_place_change_is_detected() {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempdir();
         let path = root.path().join("archive");
         std::fs::write(&path, b"original").unwrap();
         let transaction = UpdateTransaction::replace(&path).unwrap();
@@ -338,7 +343,7 @@ mod tests {
 
     #[test]
     fn new_output_never_clobbers_a_concurrent_writer() {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempdir();
         let path = root.path().join("archive");
         let transaction = UpdateTransaction::create(&path).unwrap();
         std::fs::write(&path, b"concurrent").unwrap();
@@ -351,7 +356,7 @@ mod tests {
 
     #[test]
     fn links_and_parent_traversal_are_rejected() {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempdir();
         let path = root.path().join("archive");
         std::fs::write(&path, b"original").unwrap();
         let link = root.path().join("link");
@@ -368,7 +373,7 @@ mod tests {
 
     #[test]
     fn retained_parent_survives_directory_rename() {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempdir();
         let original = root.path().join("original");
         std::fs::create_dir(&original).unwrap();
         let mut transaction = UpdateTransaction::create(&original.join("archive")).unwrap();
@@ -381,7 +386,7 @@ mod tests {
 
     #[test]
     fn directory_lock_rejects_another_cooperating_transaction() {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempdir();
         let first = UpdateTransaction::create(&root.path().join("first")).unwrap();
         assert!(UpdateTransaction::create(&root.path().join("second")).is_err());
         drop(first);
@@ -390,7 +395,7 @@ mod tests {
 
     #[test]
     fn dropping_unfinished_output_preserves_original_and_removes_provisional() {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempdir();
         let path = root.path().join("archive");
         std::fs::write(&path, b"original").unwrap();
         let mut transaction = UpdateTransaction::replace(&path).unwrap();

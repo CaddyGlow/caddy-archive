@@ -8,7 +8,7 @@ targets=${ARCHIVE_FUZZ_TARGETS:-"archive package optical"}
 [[ "$iterations" =~ ^[1-9][0-9]*$ ]] || { printf 'iterations must be positive\n' >&2; exit 2; }
 mkdir -p "$output/corpus/archive" "$output/corpus/package" "$output/corpus/optical" "$output/logs" "$output/workspace"
 cd "$root"
-cargo run --locked -p caddy-archive-core --features bzip2,brotli --example fuzz_seeds -- "$output/corpus"
+cargo run --locked --manifest-path crates/archive-core/Cargo.toml --features bzip2,brotli --example fuzz_seeds -- "$output/corpus"
 (cd crates/archive-wasm/tests/fixtures/package && sha256sum --check SHA256SUMS)
 find crates/archive-wasm/tests/fixtures/package -type f \( -name '*.msix' -o -name '*.msixbundle' -o -name '*.msi' -o -name '*.cab' \) -exec cp --backup=numbered '{}' "$output/corpus/package/" \;
 cargo run --manifest-path fuzz/Cargo.toml --locked --bin seed_iso -- "$output/corpus/optical"

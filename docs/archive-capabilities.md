@@ -123,11 +123,14 @@ under `crates/archive-core/tests/fixtures/sevenz-upstream`; it is not the
 production container implementation. Consult the lockfile and retained notices
 before redistributing binaries, WASM or fixtures.
 
-The MSI parser uses a local MIT-licensed fork of `msi` 0.10.0 under
-`../ms-package/vendor/msi`. Its required metadata-cell checks reject malformed schema rows
-instead of panicking; upstream source provenance and local changes are retained
-in `../ms-package/vendor/msi/LOCAL-CHANGES.md`. This fix does not establish that all malformed
-MSI or compound-storage inputs are safe; fuzzing remains a separate gate.
+The MSI reader consumes published `ms-package` 0.2.2 and its MIT-licensed
+`caddy-msi` 0.10.2 media backend. Compound-storage/database/media semantics live
+in `caddy-msi`; cabinet algorithms remain in published `ms-cabinet` 0.1.4.
+Metadata-cell checks reject malformed schema rows instead of panicking. External
+cabinets and loose files require explicit caller media; no host discovery or
+installer execution is introduced. Qualified registry checksums and source
+revisions are recorded in the [MSI migration plan](msi-media-refactoring-plan.md).
+Fuzzing and native installation qualification remain separate gates.
 
 Unencrypted reproducible commands are in [archive-core's README](../crates/archive-core/README.md).
 Disabling `crypto` does not remove codec LGPL obligations.

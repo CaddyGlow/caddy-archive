@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "qualification": "ms-package MSI media refactoring, 2026-10-09",
+  "registry_source": "registry+https://github.com/rust-lang/crates.io-index",
+  "packages": {
+    "ms-package": {
+      "version": "0.2.2",
+      "checksum": "957a6068fc7125e9472872c15317966f0ab010d7fe5ac25616c23a46791cc4b3",
+      "git_commit": "b05c857887f01ecc51d820ffdfb7ade5f2b28d83",
+      "repository": "https://github.com/CaddyGlow/ms-package",
+      "path_in_vcs": ""
+    },
+    "caddy-msi": {
+      "version": "0.10.2",
+      "checksum": "c59023262a23d30e440433d5958c331f4a9765f23405a5b338624be8ab75b853",
+      "git_commit": "1d9a8fe80766ed81136ab2b8c3b0574f59784d83",
+      "repository": "https://github.com/CaddyGlow/rust-msi",
+      "path_in_vcs": ""
+    },
+    "ms-cabinet": {
+      "version": "0.1.4",
+      "checksum": "ffd95ea08ac6201649b59d5bc138543e2a81477cafc74eb7ddf7db3c52b2c76c",
+      "git_commit": "6eaa28d396810bfe8183ad2f6c79b519daee88b3",
+      "repository": "https://github.com/CaddyGlow/ms-cabinet",
+      "path_in_vcs": ""
+    },
+    "ms-compress": {
+      "version": "0.1.2",
+      "checksum": "2a171863591b764e540b4dabd5a73fe89b5380826d92ac4d02d1612ed12812ea",
+      "git_commit": "b50f1264985d1db62b09beab905269ce5827c02c",
+      "repository": "https://github.com/CaddyGlow/ms-compress",
+      "path_in_vcs": ""
+    },
+    "caddy-archive-core": {
+      "version": "0.2.1",
+      "checksum": "b6eaa0c3506e268fc41b8dfa34a1c6011369ff07a60c6a66287d850b84540f65",
+      "git_commit": "cb2394c1bc5faf518a28b6edaa739c11e816cb2d",
+      "repository": "https://github.com/CaddyGlow/caddy-archive",
+      "path_in_vcs": "crates/archive-core"
+    }
+  }
+}

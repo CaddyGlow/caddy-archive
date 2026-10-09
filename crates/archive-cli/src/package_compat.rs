@@ -2,6 +2,7 @@
 //! Keep that boundary explicit instead of patching published dependencies.
 pub(crate) fn limits(value: archive_core::Limits) -> package_core::Limits {
     package_core::Limits {
+        max_buffered_bytes: value.max_buffered_bytes,
         max_entries: value.max_entries,
         max_metadata_bytes: value.max_metadata_bytes,
         max_entry_bytes: value.max_entry_bytes,

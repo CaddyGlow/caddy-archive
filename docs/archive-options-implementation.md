@@ -114,6 +114,6 @@ remain separate gates.
 Reproduce the additional reference tests after setting the two executable paths:
 
 ```sh
-ARCHIVE_REFERENCE_7ZIP=/path/to/pinned/7zz cargo test -p caddy-archive-core@0.2.1   --all-features --locked --test zip_edit pinned_7zip -- --ignored
-ARCHIVE_7Z_REFERENCE=/path/to/pinned/7zz cargo test -p caddy-archive-core@0.2.1   --all-features --locked --test sevenz_edit pinned_reference -- --ignored
+ARCHIVE_REFERENCE_7ZIP=/path/to/pinned/7zz cargo test --manifest-path crates/archive-core/Cargo.toml   --all-features --locked --test zip_edit pinned_7zip -- --ignored
+ARCHIVE_7Z_REFERENCE=/path/to/pinned/7zz cargo test --manifest-path crates/archive-core/Cargo.toml   --all-features --locked --test sevenz_edit pinned_reference -- --ignored
 ```

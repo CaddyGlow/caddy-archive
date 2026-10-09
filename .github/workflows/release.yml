@@ -26,8 +26,11 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
-      - run: cargo test -p caddy-archive-core -p caddy-archive-fs --all-features --locked
-      - run: cargo clippy -p caddy-archive-core -p caddy-archive-fs --all-targets --all-features --locked -- -D warnings
+      - run: python3 scripts/check-release-dependencies.py
+      - run: cargo test --manifest-path crates/archive-core/Cargo.toml --all-features --locked
+      - run: cargo test --manifest-path crates/archive-fs/Cargo.toml --all-features --locked
+      - run: cargo clippy --manifest-path crates/archive-core/Cargo.toml --all-targets --all-features --locked -- -D warnings
+      - run: cargo clippy --manifest-path crates/archive-fs/Cargo.toml --all-targets --all-features --locked -- -D warnings
       - name: Check tag matches package version before publication
         if: github.event_name == 'push'
         env:
@@ -68,26 +71,14 @@ jobs:
           workspaces: |
             archive-rs -> target
             archive-rs/fuzz -> target
-      - name: Package standalone sources and registry lockfile
-        working-directory: .
+      - name: Package reproducible standalone sources and registry provenance
         env:
           RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          directory="archive-rs-${RELEASE_TAG}-source"
-          mkdir -p "dist/$directory"
-          mkdir -p "dist/$directory/archive-rs"
-          git -C archive-rs log -1 --format="archive-rs %H" > "dist/$directory/COMMITS"
-          git -C archive-rs archive --format=tar --output="$RUNNER_TEMP/archive-rs.tar" HEAD
-          tar -xf "$RUNNER_TEMP/archive-rs.tar" -C "dist/$directory/archive-rs"
-          tar -czf "dist/$directory.tar.gz" -C dist "$directory"
-      - name: Verify extracted standalone source archive
+        run: python3 scripts/source-release.py --tag "$RELEASE_TAG" --output "../dist/archive-rs-${RELEASE_TAG}-source.tar.gz"
+      - name: Verify extracted standalone sources, checksums and locked builds
         env:
           RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          destination=$(mktemp -d)
-          trap 'rm -rf "$destination"' EXIT
-          tar -xzf "../dist/archive-rs-${RELEASE_TAG}-source.tar.gz" -C "$destination"
-          cargo test --manifest-path "$destination/archive-rs-${RELEASE_TAG}-source/archive-rs/Cargo.toml" --workspace --all-features --locked
+        run: python3 scripts/source-release.py --verify "../dist/archive-rs-${RELEASE_TAG}-source.tar.gz" --build
       - name: Build and verify crates.io packages
         run: cargo package --workspace --locked
       - uses: actions/upload-artifact@v4

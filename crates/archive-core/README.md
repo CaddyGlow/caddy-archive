@@ -113,9 +113,9 @@ compatibility, not modern authenticated encryption.
 From the workspace root with the committed lockfile:
 
 ```sh
-cargo build --locked -p caddy-archive-core --no-default-features --features zip,tar,gzip,cab,iso,xz,streams
-cargo test --locked -p caddy-archive-core --no-default-features --features zip,tar,gzip,cab,iso,xz,streams
-cargo clippy --locked -p caddy-archive-core --all-targets --no-default-features --features zip,tar,gzip,cab,iso,xz,streams -- -D warnings
+cargo build --locked --manifest-path crates/archive-core/Cargo.toml --no-default-features --features zip,tar,gzip,cab,iso,xz,streams
+cargo test --locked --manifest-path crates/archive-core/Cargo.toml --no-default-features --features zip,tar,gzip,cab,iso,xz,streams
+cargo clippy --locked --manifest-path crates/archive-core/Cargo.toml --all-targets --no-default-features --features zip,tar,gzip,cab,iso,xz,streams -- -D warnings
 ```
 
 Independent-tool tests additionally need `7z`, `xz`, and `gzip`; ignored tests

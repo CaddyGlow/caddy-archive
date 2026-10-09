@@ -45,7 +45,7 @@ while selected:
         if exists(package):
             print(f"Already published: {name} {package['version']}", flush=True)
         else:
-            command = ["cargo", "publish", "--locked", "-p", name]
+            command = ["cargo", "publish", "--locked", "--manifest-path", package["manifest_path"]]
             for attempt in range(8):
                 result = subprocess.run(command, text=True, stdout=subprocess.PIPE,
                                         stderr=subprocess.STDOUT)

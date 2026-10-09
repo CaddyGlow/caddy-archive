@@ -5,6 +5,12 @@ use std::{
     process::{Command, Output},
 };
 
+fn tempdir() -> tempfile::TempDir {
+    // macOS /var and other configured temporary roots can be symlink aliases.
+    // Admit a canonical root without relaxing the transaction's no-follow policy.
+    tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap()
+}
+
 fn json(output: &Output) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
         panic!(
@@ -70,7 +76,7 @@ fn extract(archive: &Path, destination: &Path, name: &str, password: Option<&Pat
 
 #[test]
 fn timestamps_change_selected_zip_and_sevenz_entries_with_verified_payloads() {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempdir();
     for format in ["zip", "7z"] {
         let archive = fixture(root.path(), format);
         let mut before =
@@ -112,7 +118,7 @@ fn timestamps_change_selected_zip_and_sevenz_entries_with_verified_payloads() {
 }
 
 fn mixed_password_edits(format: &str) {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempdir();
     let archive = fixture(root.path(), format);
     let first = password(root.path(), "first", b"first-password\n");
     let second = password(root.path(), "second", b"second-password\n");
@@ -224,7 +230,7 @@ fn selected_non_solid_sevenz_entries_keep_distinct_passwords_and_can_be_rekeyed_
 
 #[test]
 fn whole_sevenz_encryption_hides_names_and_whole_decryption_removes_header_password() {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempdir();
     let archive = fixture(root.path(), "7z");
     let credential = password(root.path(), "password", b"hidden-secret\n");
     let report = success(run(
@@ -283,7 +289,7 @@ fn whole_sevenz_encryption_hides_names_and_whole_decryption_removes_header_passw
 
 #[test]
 fn dry_run_has_no_outputs_and_alias_or_missing_credentials_preserve_sources() {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempdir();
     let archive = fixture(root.path(), "zip");
     let new_password = password(root.path(), "new", b"preview-password\n");
     let original = std::fs::read(&archive).unwrap();
@@ -356,7 +362,7 @@ fn dry_run_has_no_outputs_and_alias_or_missing_credentials_preserve_sources() {
 
 #[test]
 fn zip_header_encryption_and_selected_sevenz_header_encryption_fail_without_changes() {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempdir();
     let credential = password(root.path(), "new", b"new\n");
     for format in ["zip", "7z"] {
         let archive = fixture(root.path(), format);
@@ -378,7 +384,7 @@ fn zip_header_encryption_and_selected_sevenz_header_encryption_fail_without_chan
 
 #[test]
 fn timestamp_new_output_keeps_original_bytes() {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempdir();
     let archive = fixture(root.path(), "zip");
     let original = std::fs::read(&archive).unwrap();
     let output = root.path().join("edited.zip");
@@ -406,7 +412,7 @@ fn timestamp_new_output_keeps_original_bytes() {
 
 #[test]
 fn directory_only_and_empty_sevenz_archives_support_whole_header_encryption_and_decryption() {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempdir();
     let credential = password(root.path(), "password", b"header-only-password\n");
     for directory_only in [true, false] {
         let archive = root.path().join(if directory_only {

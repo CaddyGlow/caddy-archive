@@ -852,7 +852,8 @@ impl ByteInstaller {
             .iter()
             .map(|file| {
                 serde_json::json!({
-                    "id": file.id, "path": file.path, "size": file.size, "cabinet": file.cabinet,
+                    "id": file.id, "path": file.path, "source_path": file.source_path,
+                    "size": file.size, "cabinet": file.cabinet,
                 })
             })
             .collect();

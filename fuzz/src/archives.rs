@@ -2,6 +2,16 @@
 use archive_core::{Archive, Format, Limits};
 use std::io::Cursor;
 
+struct CallerBytes<'a>(&'a [u8]);
+impl ms_package::MediaResolver for CallerBytes<'_> {
+    fn resolve(&mut self, _name: &str, maximum: u64) -> ms_package::Result<Vec<u8>> {
+        if self.0.len() as u64 > maximum {
+            return Err(ms_package::Error::Limit("fuzz caller media bytes"));
+        }
+        Ok(self.0.to_vec())
+    }
+}
+
 fn limits() -> Limits {
     Limits {
         max_buffered_bytes: 2 << 20,
@@ -51,6 +61,7 @@ pub fn package(data: &[u8]) {
     if let Ok(mut package) = ms_package::AppxPackage::open(
         Cursor::new(data),
         package_core::Limits {
+            max_buffered_bytes: 2 << 20,
             max_entries: 128,
             max_metadata_bytes: 1 << 20,
             max_entry_bytes: 1 << 20,
@@ -70,7 +81,21 @@ pub fn package(data: &[u8]) {
     if let Ok(mut package) =
         ms_package::InstallerPackage::open_bounded(Cursor::new(data), 128, 1 << 20)
     {
-        let _ = package.files();
+        if let Ok(files) = package.files() {
+            let mut remaining = 2 << 20;
+            for file in files.into_iter().take(8) {
+                if file.size > 1 << 20 || file.size > remaining {
+                    continue;
+                }
+                // The mutated input is the only external source. Never discover
+                // host files while exercising the backend's bounded media path.
+                if let Ok(bytes) =
+                    package.read_file(&file, &mut CallerBytes(data), remaining.min(1 << 20))
+                {
+                    remaining -= bytes.len() as u64;
+                }
+            }
+        }
         for table in package.tables().into_iter().take(16) {
             let _ = package.table(&table);
         }

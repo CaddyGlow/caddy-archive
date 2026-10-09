@@ -1766,7 +1766,7 @@ fn package_operation(
                         println!("{:>12} {}", file.size, file.path);
                     }
                 }
-                let entries:Vec<_>=files.iter().map(|f|serde_json::json!({"id":f.id,"name":f.path,"size":f.size,"sequence":f.sequence,"cabinet":f.cabinet})).collect();
+                let entries:Vec<_>=files.iter().map(|f|serde_json::json!({"id":f.id,"name":f.path,"source_path":f.source_path,"size":f.size,"sequence":f.sequence,"cabinet":f.cabinet})).collect();
                 serde_json::json!({"schema_version":1,"ok":true,"operation":"list","format":"msi","entries":entries,"tables":package.tables(),"streams":package.streams()})
             }
             Command::Test { .. } | Command::Extract { .. } => {
@@ -1809,9 +1809,9 @@ fn package_operation(
                     let bytes = package.read_file(file, &mut resolver, limits.max_entry_bytes)?;
                     total = total
                         .checked_add(bytes.len() as u64)
-                        .ok_or("decoded size overflow")?;
+                        .ok_or(ms_package::Error::Limit("total decoded bytes"))?;
                     if total > limits.max_total_bytes {
-                        return Err("total decoded bytes limit exceeded".into());
+                        return Err(ms_package::Error::Limit("total decoded bytes").into());
                     }
                     if let Some(spool) = &mut pending {
                         spool.stage_validated(id, path, bytes.len() as u64)?;

@@ -1,0 +1,3 @@
+# Explicit MSI caller-media artifacts are byte fixtures, including .txt payloads.
+# Preserve their declared sizes and hashes in Windows autocrlf checkouts.
+/crates/archive-wasm/tests/fixtures/package/media-migration/**/sidecars/** -text

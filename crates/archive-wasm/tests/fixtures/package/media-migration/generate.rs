@@ -180,6 +180,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             serde_json::json!({"msi":msi_artifact,"media":sidecars,"files":files}),
         );
     }
+    let mut checksums = String::new();
+    for (name, info) in &artifacts {
+        let digest = info["sha256"].as_str().ok_or("missing artifact checksum")?;
+        checksums.push_str(&format!("{digest}  {name}\n"));
+    }
+    std::fs::write(destination.join("SHA256SUMS"), checksums)?;
     let manifest = serde_json::json!({"schema_version":1,
         "provenance":"generated unsigned test-only data; published registry writers and readers; no installer execution or trust claim",
         "dependencies":{"ms-package":"0.2.2","caddy-msi":"0.10.2","caddy-archive-core":"0.2.1","ms-cabinet":"0.1.4"},

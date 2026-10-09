@@ -45,7 +45,8 @@ fn shared_selector_controls_list_test_and_extract_with_directory_boundaries() {
         let output = command.output().unwrap();
         assert!(
             output.status.success(),
-            "{}",
+            "{operation} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
         let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();

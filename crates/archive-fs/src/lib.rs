@@ -567,9 +567,13 @@ mod windows {
         _handles: Vec<std::fs::File>,
     }
     fn pin(path: &Path) -> io::Result<std::fs::File> {
+        pin_with_access(path, 0x80000000)
+    }
+    fn pin_with_access(path: &Path, access: u32) -> io::Result<std::fs::File> {
         // Denying FILE_SHARE_DELETE pins the name until every directory handle is released.
         let file = std::fs::OpenOptions::new()
             .read(true)
+            .access_mode(access)
             .share_mode(3)
             .custom_flags(0x00200000 | 0x02000000)
             .open(path)?;
@@ -586,7 +590,14 @@ mod windows {
             metadata: &archive_core::EntryMetadata,
         ) -> io::Result<()> {
             let parent = self.parent(parts)?;
-            apply_metadata(&pin(&parent.path)?, metadata)
+            // SetFileTime requires FILE_WRITE_ATTRIBUTES on the retained directory handle.
+            let access = 0x80000000
+                | if metadata.modified.is_some() || metadata.unix_mode.is_some() {
+                    0x100
+                } else {
+                    0
+                };
+            apply_metadata(&pin_with_access(&parent.path, access)?, metadata)
         }
         pub fn scratch_file(&self) -> io::Result<std::fs::File> {
             tempfile::tempfile_in(&self.path)
@@ -674,6 +685,34 @@ impl Drop for Temporary {
 mod tests {
     use super::*;
     use std::io::Write;
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn directory_timestamp_is_restored_through_admitted_handle() {
+        let root =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let mut destination = Destination::open(root.path()).unwrap();
+        destination.directory(b"nested").unwrap();
+        let seconds = 1_700_000_000;
+        destination
+            .directory_metadata(
+                b"nested",
+                &archive_core::EntryMetadata {
+                    modified: Some(archive_core::StoredTimestamp::UnixSeconds(seconds)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(root.path().join("nested"))
+                .unwrap()
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            seconds
+        );
+    }
     #[test]
     fn unsafe_names_are_rejected() {
         for name in ["../x", "/x", "C:x", "a\\b", "a//b", "a/./b", "CON", "a."] {

@@ -55,7 +55,7 @@ name = "archive-fuzz"
 version = "0.1.0"
 dependencies = [
  "caddy-archive-core 0.2.1",
- "caddy-archive-core 0.3.1",
+ "caddy-archive-core 0.3.2",
  "honggfuzz",
  "libmkiso",
  "ms-cabinet",
@@ -155,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-archive-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "aes",
  "brotli",

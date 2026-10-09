@@ -18,8 +18,8 @@ progress = ["dep:indicatif"]
 
 [dependencies]
 package-core = { package = "caddy-archive-core", version = "=0.2.1", default-features = false }
-archive-core = { version = "0.3.1", package = "caddy-archive-core", path = "../archive-core", features = ["crypto", "wim", "sevenz", "udf", "bzip2", "brotli"] }
-archive-fs = { version = "0.3.1", package = "caddy-archive-fs", path = "../archive-fs" }
+archive-core = { version = "0.3.2", package = "caddy-archive-core", path = "../archive-core", features = ["crypto", "wim", "sevenz", "udf", "bzip2", "brotli"] }
+archive-fs = { version = "0.3.2", package = "caddy-archive-fs", path = "../archive-fs" }
 ms-package = { version = "0.2.2" }
 clap = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

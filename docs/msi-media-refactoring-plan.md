@@ -1,6 +1,6 @@
 # archive-rs MSI media backend migration plan
 
-Status: implemented consumer integration for published ms-package 0.2.2 and published archive-rs 0.3.0. The 0.3.0 workspace version boundary resolved the equal-version dependency alias publication conflict. Version 0.3.1 repairs release qualification by adding reproducible media fixture checksums and preserving sidecar bytes in Windows autocrlf checkouts. ms-package 0.2.1 updated the package-core dependency but did not contain the media migration.
+Status: implemented consumer integration for published ms-package 0.2.2 and published archive-rs 0.3.0. The 0.3.0 workspace version boundary resolved the equal-version dependency alias publication conflict. Version 0.3.1 repairs fixture qualification by adding reproducible media checksums and preserving sidecar bytes in Windows autocrlf checkouts. Version 0.3.2 includes the Windows directory timestamp handle fix found during follow-up CI. ms-package 0.2.1 updated the package-core dependency but did not contain the media migration.
 
 ## Scope
 

@@ -12,11 +12,9 @@ payloads, changing their declared sizes and hashes and causing the loose-media
 regression to fail its input budget. The patch preserves the original bytes on
 Windows as well as Unix.
 
-Windows extraction now opens directory metadata handles with
-`FILE_WRITE_ATTRIBUTES`, which Windows requires when setting directory
-timestamps. Previously, applying a timestamp through a read-only pinned handle
-could fail with access denied. Directory pinning and reparse-point checks remain
-in place.
+Follow-up qualification found a Windows directory timestamp handle access bug.
+The fix is included in [0.3.2](release-0.3.2.md); the published 0.3.1 archives
+identify the earlier fixture repair commit.
 
 The public archive APIs remain those of [0.3.0](release-0.3.0.md).
 The four workspace crates move together to 0.3.1;

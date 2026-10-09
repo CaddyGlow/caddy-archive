@@ -176,9 +176,13 @@ pub(crate) struct DeflateWriter<W> {
 ))]
 impl<W: Write> DeflateWriter<W> {
     pub(crate) fn new(writer: W, window: i32) -> Self {
+        Self::with_level(writer, window, 6)
+    }
+    pub(crate) fn with_level(writer: W, window: i32, level: u8) -> Self {
         Self {
             writer,
             encoder: Deflate::new_with_config(DeflateConfig {
+                level: i32::from(level),
                 window_bits: window,
                 ..Default::default()
             }),

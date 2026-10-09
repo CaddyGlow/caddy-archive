@@ -10,8 +10,9 @@ Reusable archive libraries and tools, extracted from windows-uup.
 - `../ms-package`: standalone `ms-package` crate for portable APPX/MSIX
   and MSI inspection, including its patched MSI reader.
 
-Keep sibling `../cabinet`, `../ms-compress`, `../wim-rs`, and `../mkiso-rs` checkouts.
-Compression, WIM, and the libmkiso library come from their own repositories.
+Published dependencies resolve from crates.io; sibling checkouts are optional
+for development of those dependencies. Compression, WIM, and the libmkiso library
+come from their own repositories.
 No windows-uup checkout is required to build this workspace.
 Boot-media assembly and the mkiso CLI live in mkiso-rs; servicing and UUP-specific
 CAB validation stay in windows-uup. Its consumers and defender-rs depend on this workspace by path.
@@ -30,6 +31,13 @@ Run archive/browser/fuzz scripts from this root. See
 Windows filesystem behavior, bootability, or native installation correctness.
 Retained evidence describes its original runs. Build caches and historical
 campaign artifacts remain at their original windows-uup locations.
+
+The [options/update implementation](docs/archive-options-implementation.md)
+records the current subset of the [7-Zip compatibility and editing plan](docs/archive-options-update-plan.md).
+`arc capabilities --json` reports the source-linked inventory, build capabilities,
+and supported editing profile. ZIP rename/delete and ZIP/7z timestamp and encryption
+edits support dry runs and guarded Unix publication. Browser Worker editing returns
+a new byte artifact. 7z can encrypt filenames; ZIP supports per-entry passwords.
 
 CI uses published crates.io dependencies and retained local regression fixtures.
 Fixture provenance and reproduction instructions are stored alongside the samples;

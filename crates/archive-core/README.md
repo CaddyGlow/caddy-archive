@@ -1,5 +1,39 @@
 # archive-core
 
+`compatibility::inventory()` exposes source-linked native and planned option
+behavior. `selection::NameSelection` matches stored name bytes with bounded
+component wildcards or literal patterns and an explicit case policy. Its matches
+never grant permission to publish a filesystem path.
+
+`options::DeflateOptions` configures native effort levels 0–9 for
+`deflate_stream_with_options`; default effort remains 6. This is backend tuning,
+without a claim of identical 7-Zip output. Existing creation APIs remain intact.
+
+`update` supplies all seven pairing states, add/update/delete/freshen/synchronize
+action sets, repeated `-u` grammar and anti-item gating. Callers supply time
+comparisons after applying archive precision/timezone/range rules. Classification
+and parsing do not execute edits or prove content equality.
+
+With `zip`, `zip_edit::plan` validates simultaneous rename/delete, modification-time
+and encryption operations and
+metadata preservation before `execute` streams unchanged packed data into an
+empty provisional writer. Plans expose dry-run decisions; cancellation is checked
+between bounded copies. Callers keep input stable, discard failed output and own
+publication. Comments, attributes, known extras and ciphertext survive the
+supported profile; unsupported preservation fails explicitly. No payloads are
+decoded or authenticated by copying. `execute_with_options` accepts separate borrowed
+credentials and caller randomness; changed encryption payloads are decoded and
+verified before compressed-stream transformation. `validate_credentials` supports
+preflight without output. ZIP UT seconds are authoritative, with a UTC-derived DOS
+fallback; existing NTFS modification times are updated and other times preserved.
+
+With `sevenz`, `sevenz_edit::edit` preserves raw file properties and unchanged packed
+streams while editing timestamps or wrapping/removing AES at the compressed-stream
+boundary. Encryption operates on complete compression groups; solid subsets fail.
+Encrypted-header partial password changes fail without separate credentials. The
+caller controls header encryption and supplies old/new passwords and randomness.
+See [implementation scope](../../docs/archive-options-implementation.md).
+
 Portable archive containers over `Read`, `Seek`, and `Write`, using
 `ms-compress` codecs. Filesystem publication, path policy, scheduling and OS
 randomness belong to callers (`archive-fs` and `archive-cli`), not this crate.

@@ -141,7 +141,113 @@ self.onmessage = async () => {
       try { wrong.test(); } catch (_) { rejected = true; }
       assert(rejected, 'AES wrong password rejected');
     } finally { wrong.free(); }
+    stage = 'zip-edit';
+    const editBudget = 1024n * 1024n;
+    function packedZipBytes(bytes) {
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const central = view.getUint32(bytes.length - 6, true);
+      const packedSize = view.getUint32(central + 20, true);
+      const payloadStart = 30 + view.getUint16(26, true) + view.getUint16(28, true);
+      return bytes.slice(payloadStart, payloadStart + packedSize);
+    }
+    for (const [source, oldName, secret] of [
+      [create_file('zip', 'payload.txt', payload, editBudget), 'payload.txt', false],
+      [encrypted, 'secret.txt', true],
+    ]) {
+      const snapshot = source.slice();
+      const originalPacked = packedZipBytes(source);
+      const renamed = wasm.edit_zip(source, JSON.stringify([{operation: 'rename', from: oldName, to: 'renamed.txt'}]), editBudget, editBudget, editBudget, editBudget);
+      assert(source.every((byte, i) => byte === snapshot[i]), 'ZIP editing keeps source bytes');
+      const rewrittenPacked = packedZipBytes(renamed);
+      assert(originalPacked.length === rewrittenPacked.length && originalPacked.every((byte, i) => byte === rewrittenPacked[i]), 'ZIP packed/ciphertext reuse');
+      const reader = secret ? ByteArchive.with_password(renamed, password, editBudget) : new ByteArchive(renamed, editBudget, editBudget);
+      try {
+        assert(JSON.parse(reader.entries_json())[0].name === 'renamed.txt', 'ZIP rename metadata');
+        const decoded = reader.read_entry(0, 1024n);
+        assert(decoded.length === payload.length && decoded.every((byte, i) => byte === payload[i]), 'ZIP edit payload parity');
+        reader.test();
+      } finally { reader.free(); }
+      const deleted = wasm.edit_zip(renamed, JSON.stringify([{operation: 'delete', name: 'renamed.txt'}]), editBudget, editBudget, editBudget, editBudget);
+      const empty = new ByteArchive(deleted, editBudget, editBudget);
+      try { assert(JSON.parse(empty.entries_json()).length === 0, 'ZIP delete produces empty archive'); }
+      finally { empty.free(); }
+      for (const args of [
+        [source, '[]', BigInt(source.length - 1), editBudget, editBudget, editBudget],
+        [source, '[]', editBudget, editBudget, editBudget, 1n],
+        [source, '[]', editBudget, 128n, editBudget, editBudget],
+        [source, '[]', editBudget, editBudget, 1n, editBudget],
+        [source, JSON.stringify([{operation: 'delete', name: 'missing'}]), editBudget, editBudget, editBudget, editBudget],
+        [source, JSON.stringify([{operation: 'rename', from: oldName, to: 'new', ignored: true}]), editBudget, editBudget, editBudget, editBudget],
+      ]) {
+        let rejected = false;
+        try { wasm.edit_zip(...args); } catch (_) { rejected = true; }
+        assert(rejected, 'ZIP editing validates operation/input/output budgets');
+      }
+    }
+    for (const marker of ['AppxManifest.xml', 'AppxBlockMap.xml', 'AppxSignature.p7x', 'AppxMetadata/AppxBundleManifest.xml', '.signature.p7s', 'META-INF/ARCHIVE.RSA']) {
+      const packageLikeZip = create_file('zip', marker, payload, editBudget);
+      let rejected = false;
+      try { wasm.edit_zip(packageLikeZip, '[]', editBudget, editBudget, editBudget, editBudget); }
+      catch (error) { rejected = String(error).includes('package/signature'); }
+      assert(rejected, 'ZIP editing requires package/signature policy');
+    }
     stage = '7z-encryption';
+    for (const format of ['zip', '7z']) {
+      stage = `${format}-timestamp-password-edit`;
+      const source = create_file(format, 'payload.txt', payload, editBudget);
+      const replacementPassword = new TextEncoder().encode('replacement-browser-password');
+      const operations = JSON.stringify([
+        {operation: 'modified', name: 'payload.txt', modified_unix_seconds: 1700000001},
+        {operation: 'encryption', name: 'payload.txt', encrypted: true},
+      ]);
+      const edited = format === 'zip'
+        ? wasm.edit_zip_with_passwords(source, operations, undefined, password, editBudget, editBudget, editBudget, editBudget)
+        : wasm.edit_7z(source, operations, undefined, password, true, editBudget, editBudget, editBudget, editBudget);
+      const reader = ByteArchive.with_password(edited, password, editBudget);
+      try {
+        assert(JSON.parse(reader.entry_metadata_json(0)).modified.UnixSeconds === 1700000001, `${format} edited timestamp`);
+        reader.test();
+      } finally { reader.free(); }
+      if (format === '7z') {
+        let hidden = false;
+        try { const noPassword = new ByteArchive(edited, editBudget, editBudget); noPassword.free(); }
+        catch (_) { hidden = true; }
+        assert(hidden, '7z edited filenames encrypted');
+      }
+      const rekey = JSON.stringify([{operation: 'encryption', encrypted: true, name: 'payload.txt'}]);
+      const rekeyed = format === 'zip'
+        ? wasm.edit_zip_with_passwords(edited, rekey, password, replacementPassword, editBudget, editBudget, editBudget, editBudget)
+        : wasm.edit_7z(edited, rekey, password, replacementPassword, true, editBudget, editBudget, editBudget, editBudget);
+      const replacementReader = ByteArchive.with_password(rekeyed, replacementPassword, editBudget);
+      try { replacementReader.test(); } finally { replacementReader.free(); }
+      const decrypt = JSON.stringify([{operation: 'encryption', encrypted: false, name: 'payload.txt'}]);
+      const decrypted = format === 'zip'
+        ? wasm.edit_zip_with_passwords(rekeyed, decrypt, replacementPassword, undefined, editBudget, editBudget, editBudget, editBudget)
+        : wasm.edit_7z(rekeyed, decrypt, replacementPassword, undefined, false, editBudget, editBudget, editBudget, editBudget);
+      const plainReader = new ByteArchive(decrypted, editBudget, editBudget);
+      try {
+        assert(plainReader.read_entry(0, 1024n).every((byte, i) => byte === payload[i]), `${format} edit roundtrip`);
+        plainReader.test();
+      } finally { plainReader.free(); }
+      let rejected = false;
+      try {
+        if (format === 'zip') wasm.edit_zip_with_passwords(edited, decrypt, new Uint8Array([1]), undefined, editBudget, editBudget, editBudget, editBudget);
+        else wasm.edit_7z(edited, decrypt, new Uint8Array([1]), undefined, false, editBudget, editBudget, editBudget, editBudget);
+      } catch (_) { rejected = true; }
+      assert(rejected, `${format} edit rejects wrong password`);
+      for (const [inputBudget, decodedBudget, outputBudget] of [
+        [BigInt(source.length - 1), editBudget, editBudget],
+        [editBudget, 1n, editBudget],
+        [editBudget, editBudget, 1n],
+      ]) {
+        let limited = false;
+        try {
+          if (format === 'zip') wasm.edit_zip_with_passwords(source, operations, undefined, password, inputBudget, editBudget, decodedBudget, outputBudget);
+          else wasm.edit_7z(source, operations, undefined, password, true, inputBudget, editBudget, decodedBudget, outputBudget);
+        } catch (_) { limited = true; }
+        assert(limited, `${format} encryption edit budgets`);
+      }
+    }
     for (const headers of [false, true]) {
       const bytes = create_encrypted_archive_file('7z', 'secret.txt', payload, password, 1024n * 1024n, headers);
       const archive = ByteArchive.with_password(bytes, password, 1024n * 1024n);
@@ -177,7 +283,7 @@ self.onmessage = async () => {
       } catch (error) { cancelled = error.name === 'AbortError'; }
       assert(cancelled && cancelledBytes < largePayload.length, 'huge-entry cooperative cancellation');
     } finally { rangeArchive.index.free(); }
-    self.postMessage({ok: true, profiles, packages: ['msix', 'msixbundle', 'msi'], encryption: ['zip-aes256', '7z-aes256-headers'], incremental: 'zip-blob-16MiB-cancellation', worker: true});
+    self.postMessage({ok: true, profiles, packages: ['msix', 'msixbundle', 'msi'], encryption: ['zip-aes256', '7z-aes256-headers'], incremental: 'zip-blob-16MiB-cancellation', editing: ['zip-rename-delete-packed-ciphertext', 'zip-7z-timestamp-encrypt-rekey-decrypt'], worker: true});
   } catch (error) {
     self.postMessage({ok: false, stage, error: String(error)});
   }

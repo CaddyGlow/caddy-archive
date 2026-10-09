@@ -286,7 +286,12 @@ pub(crate) fn preflight(reader: &mut (impl Read + Seek), limits: Limits) -> Resu
             .try_into()
             .map_err(|_| Error::Malformed("ZIP end record".into()))?,
     ));
-    if count == u64::from(u16::MAX) || size == u64::from(u32::MAX) {
+    let directory_offset = u32::from_le_bytes(
+        record[16..20]
+            .try_into()
+            .map_err(|_| Error::Malformed("ZIP end record".into()))?,
+    );
+    if count == u64::from(u16::MAX) || size == u64::from(u32::MAX) || directory_offset == u32::MAX {
         let absolute = length - tail_len + eocd as u64;
         if absolute < 20 {
             return Err(Error::Malformed("ZIP64 locator missing".into()));
@@ -446,7 +451,7 @@ fn u64le(w: &mut impl Write, v: u64) -> Result<()> {
     w.write_all(&v.to_le_bytes())?;
     Ok(())
 }
-/// Always writes ZIP64 sizes and end records, allowing one uniform checked profile.
+/// Selects classic ZIP or ZIP64 fields automatically while streaming payloads.
 pub(crate) fn create(entries: &[CreateEntry], writer: &mut (impl Write + Seek)) -> Result<()> {
     create_impl(
         entries,
@@ -581,21 +586,41 @@ pub(crate) fn create_readers<'a, E: crate::CreationEntry>(
         let flags = 0x800 | u16::from(encrypted) | if descriptor { 8 } else { 0 };
         let offset = writer.stream_position()?;
         u32le(writer, 0x04034b50)?;
-        u16le(writer, 45)?;
+        let local_zip64 = reserve_zip64(entry.source_size(), compression, encrypted);
+        let version = if aes {
+            51
+        } else if local_zip64 {
+            45
+        } else {
+            20
+        };
+        u16le(writer, version)?;
         u16le(writer, flags)?;
         u16le(writer, method)?;
         u16le(writer, dos_time)?;
         u16le(writer, dos_date)?;
         u32le(writer, 0)?;
-        u32le(writer, u32::MAX)?;
-        u32le(writer, u32::MAX)?;
+        u32le(writer, if local_zip64 { u32::MAX } else { 0 })?;
+        u32le(
+            writer,
+            if local_zip64 {
+                u32::MAX
+            } else {
+                entry.source_size() as u32
+            },
+        )?;
         u16le(writer, name_len)?;
-        u16le(writer, (if aes { 31 } else { 20 }) + timestamp_len)?;
+        u16le(
+            writer,
+            (if local_zip64 { 20 } else { 0 }) + (if aes { 11 } else { 0 }) + timestamp_len,
+        )?;
         writer.write_all(name)?;
-        u16le(writer, 1)?;
-        u16le(writer, 16)?;
-        u64le(writer, entry.source_size())?;
-        u64le(writer, 0)?;
+        if local_zip64 {
+            u16le(writer, 1)?;
+            u16le(writer, 16)?;
+            u64le(writer, entry.source_size())?;
+            u64le(writer, 0)?;
+        }
         if aes {
             writer.write_all(&[1, 0x99, 7, 0, 2, 0, b'A', b'E', 3, actual_method as u8, 0])?;
         }
@@ -626,27 +651,58 @@ pub(crate) fn create_readers<'a, E: crate::CreationEntry>(
         let crc = if aes { 0 } else { original_crc };
         writer.seek(SeekFrom::Start(offset + 14))?;
         u32le(writer, crc)?;
-        writer.seek(SeekFrom::Start(offset + 30 + u64::from(name_len) + 12))?;
-        u64le(writer, compressed_size)?;
+        if local_zip64 {
+            writer.seek(SeekFrom::Start(offset + 30 + u64::from(name_len) + 12))?;
+            u64le(writer, compressed_size)?;
+        } else {
+            if compressed_size >= u64::from(u32::MAX) {
+                return Err(Error::Unsupported(
+                    "ZIP payload exceeded reserved classic size".into(),
+                ));
+            }
+            u32le(writer, compressed_size as u32)?;
+            u32le(writer, entry.source_size() as u32)?;
+        }
         writer.seek(SeekFrom::Start(payload_end))?;
         if descriptor {
             u32le(writer, 0x08074b50)?;
             u32le(writer, crc)?;
-            u64le(writer, compressed_size)?;
-            u64le(writer, entry.source_size())?;
+            if local_zip64 {
+                u64le(writer, compressed_size)?;
+                u64le(writer, entry.source_size())?;
+            } else {
+                u32le(writer, compressed_size as u32)?;
+                u32le(writer, entry.source_size() as u32)?;
+            }
         }
+        let central_extra = zip64_extra(entry.source_size(), compressed_size, offset)?;
+        let central_version = if !central_extra.is_empty() {
+            version.max(45)
+        } else {
+            version
+        };
         u32le(&mut central, 0x02014b50)?;
-        u16le(&mut central, if metadata.is_some() { 0x032d } else { 45 })?;
-        u16le(&mut central, 45)?;
+        u16le(
+            &mut central,
+            if metadata.is_some() {
+                0x0300 | central_version
+            } else {
+                central_version
+            },
+        )?;
+        u16le(&mut central, central_version)?;
         u16le(&mut central, flags)?;
         u16le(&mut central, method)?;
         u16le(&mut central, dos_time)?;
         u16le(&mut central, dos_date)?;
         u32le(&mut central, crc)?;
-        u32le(&mut central, u32::MAX)?;
-        u32le(&mut central, u32::MAX)?;
+        u32le(&mut central, classic_field(compressed_size))?;
+        u32le(&mut central, classic_field(entry.source_size()))?;
         u16le(&mut central, name_len)?;
-        u16le(&mut central, (if aes { 39 } else { 28 }) + timestamp_len)?;
+        u16le(
+            &mut central,
+            central_extra.len() as u16 + (if aes { 11 } else { 0 }) + timestamp_len,
+        )?;
         u16le(&mut central, 0)?;
         u16le(&mut central, 0)?;
         u16le(&mut central, 0)?;
@@ -659,13 +715,9 @@ pub(crate) fn create_readers<'a, E: crate::CreationEntry>(
                     0
                 },
         )?;
-        u32le(&mut central, u32::MAX)?;
+        u32le(&mut central, classic_field(offset))?;
         central.write_all(name)?;
-        u16le(&mut central, 1)?;
-        u16le(&mut central, 24)?;
-        u64le(&mut central, entry.source_size())?;
-        u64le(&mut central, compressed_size)?;
-        u64le(&mut central, offset)?;
+        central.write_all(&central_extra)?;
         if aes {
             central.write_all(&[1, 0x99, 7, 0, 2, 0, b'A', b'E', 3, actual_method as u8, 0])?;
         }
@@ -673,29 +725,12 @@ pub(crate) fn create_readers<'a, E: crate::CreationEntry>(
     }
     let directory = writer.stream_position()?;
     writer.write_all(&central)?;
-    let zip64 = writer.stream_position()?;
-    u32le(writer, 0x06064b50)?;
-    u64le(writer, 44)?;
-    u16le(writer, 45)?;
-    u16le(writer, 45)?;
-    u32le(writer, 0)?;
-    u32le(writer, 0)?;
-    u64le(writer, entries.len() as u64)?;
-    u64le(writer, entries.len() as u64)?;
-    u64le(writer, central.len() as u64)?;
-    u64le(writer, directory)?;
-    u32le(writer, 0x07064b50)?;
-    u32le(writer, 0)?;
-    u64le(writer, zip64)?;
-    u32le(writer, 1)?;
-    u32le(writer, 0x06054b50)?;
-    u16le(writer, 0)?;
-    u16le(writer, 0)?;
-    u16le(writer, u16::MAX)?;
-    u16le(writer, u16::MAX)?;
-    u32le(writer, u32::MAX)?;
-    u32le(writer, u32::MAX)?;
-    u16le(writer, 0)?;
+    write_end_records(
+        writer,
+        entries.len() as u64,
+        central.len() as u64,
+        directory,
+    )?;
     Ok(())
 }
 
@@ -738,4 +773,269 @@ fn write_payload<'a>(
         compressor.finish()?;
     }
     Ok(crc)
+}
+
+// Reserve space before compression to allow worst-case expansion, matching 7-Zip.
+fn reserve_zip64(size: u64, compression: crate::ZipCompression, encrypted: bool) -> bool {
+    size >= if compression == crate::ZipCompression::Copy && !encrypted {
+        u64::from(u32::MAX)
+    } else {
+        0xf800_0000
+    }
+}
+fn classic_field(value: u64) -> u32 {
+    value.min(u64::from(u32::MAX)) as u32
+}
+fn zip64_extra(size: u64, compressed: u64, offset: u64) -> Result<Vec<u8>> {
+    let mut values = Vec::new();
+    for value in [size, compressed, offset] {
+        if value >= u64::from(u32::MAX) {
+            u64le(&mut values, value)?;
+        }
+    }
+    let mut extra = Vec::new();
+    if !values.is_empty() {
+        u16le(&mut extra, 1)?;
+        u16le(&mut extra, values.len() as u16)?;
+        extra.extend_from_slice(&values);
+    }
+    Ok(extra)
+}
+pub(crate) fn write_end_records(
+    writer: &mut (impl Write + Seek),
+    count: u64,
+    size: u64,
+    directory: u64,
+) -> Result<()> {
+    if count >= u64::from(u16::MAX)
+        || size >= u64::from(u32::MAX)
+        || directory >= u64::from(u32::MAX)
+    {
+        let zip64 = writer.stream_position()?;
+        u32le(writer, 0x06064b50)?;
+        u64le(writer, 44)?;
+        u16le(writer, 45)?;
+        u16le(writer, 45)?;
+        u32le(writer, 0)?;
+        u32le(writer, 0)?;
+        u64le(writer, count)?;
+        u64le(writer, count)?;
+        u64le(writer, size)?;
+        u64le(writer, directory)?;
+        u32le(writer, 0x07064b50)?;
+        u32le(writer, 0)?;
+        u64le(writer, zip64)?;
+        u32le(writer, 1)?;
+    }
+    u32le(writer, 0x06054b50)?;
+    u16le(writer, 0)?;
+    u16le(writer, 0)?;
+    u16le(writer, count.min(u64::from(u16::MAX)) as u16)?;
+    u16le(writer, count.min(u64::from(u16::MAX)) as u16)?;
+    u32le(writer, classic_field(size))?;
+    u32le(writer, classic_field(directory))?;
+    u16le(writer, 0)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod sizing_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn local_reservation_observes_stored_and_compression_boundaries() {
+        for encrypted in [false, true] {
+            for compression in [crate::ZipCompression::Copy, crate::ZipCompression::Deflate] {
+                let threshold = if !encrypted && compression == crate::ZipCompression::Copy {
+                    u64::from(u32::MAX)
+                } else {
+                    0xf800_0000
+                };
+                assert!(!reserve_zip64(threshold - 1, compression, encrypted));
+                assert!(reserve_zip64(threshold, compression, encrypted));
+                assert!(reserve_zip64(threshold + 1, compression, encrypted));
+            }
+        }
+    }
+
+    #[test]
+    fn central_extra_selects_each_sentinel_field_independently() {
+        let sentinel = u64::from(u32::MAX);
+        for mask in 0..8 {
+            let fields = [0, 1, 2].map(|bit| {
+                if mask & (1 << bit) != 0 {
+                    sentinel + bit
+                } else {
+                    sentinel - 1
+                }
+            });
+            let extra = zip64_extra(fields[0], fields[1], fields[2]).unwrap();
+            let selected: Vec<_> = fields
+                .into_iter()
+                .filter(|value| *value >= sentinel)
+                .collect();
+            if selected.is_empty() {
+                assert!(extra.is_empty());
+            } else {
+                assert_eq!(u16::from_le_bytes([extra[0], extra[1]]), 1);
+                assert_eq!(
+                    usize::from(u16::from_le_bytes([extra[2], extra[3]])),
+                    selected.len() * 8
+                );
+                let values: Vec<_> = extra[4..]
+                    .chunks_exact(8)
+                    .map(|value| u64::from_le_bytes(value.try_into().unwrap()))
+                    .collect();
+                assert_eq!(values, selected);
+            }
+        }
+    }
+
+    #[test]
+    fn end_records_switch_at_each_sentinel_and_preflight_detects_offset_only() {
+        for (count, size, offset, expected_zip64) in [
+            (65534, 0xffff_fffe, 0xffff_fffe, false),
+            (65535, 0, 0, true),
+            (65536, 0, 0, true),
+            (0, 0xffff_ffff, 0, true),
+            (0, 0x1_0000_0000, 0, true),
+            (0, 0, 0xffff_ffff, true),
+            (0, 0, 0x1_0000_0000, true),
+        ] {
+            let mut output = Cursor::new(Vec::new());
+            write_end_records(&mut output, count, size, offset).unwrap();
+            assert_eq!(output.get_ref().starts_with(b"PK\x06\x06"), expected_zip64);
+            let end = &output.get_ref()[output.get_ref().len() - 22..];
+            assert_eq!(
+                u32::from_le_bytes(end[16..20].try_into().unwrap()),
+                classic_field(offset)
+            );
+            if count == 0 && size == 0 {
+                let result = preflight(&mut output, Limits::default()).unwrap();
+                assert_eq!(result.entries, 0);
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct SparseIo {
+        position: u64,
+        length: u64,
+        bytes: std::collections::BTreeMap<u64, u8>,
+    }
+    impl Write for SparseIo {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            for byte in bytes {
+                self.bytes.insert(self.position, *byte);
+                self.position += 1;
+            }
+            self.length = self.length.max(self.position);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Read for SparseIo {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            let count = output
+                .len()
+                .min(self.length.saturating_sub(self.position) as usize);
+            for byte in &mut output[..count] {
+                *byte = self.bytes.get(&self.position).copied().unwrap_or(0);
+                self.position += 1;
+            }
+            Ok(count)
+        }
+    }
+    impl Seek for SparseIo {
+        fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+            self.position = match from {
+                SeekFrom::Start(value) => Some(value),
+                SeekFrom::End(value) => self.length.checked_add_signed(value),
+                SeekFrom::Current(value) => self.position.checked_add_signed(value),
+            }
+            .ok_or_else(|| std::io::Error::other("invalid sparse seek"))?;
+            Ok(self.position)
+        }
+    }
+
+    #[test]
+    fn large_offset_small_payload_uses_only_offset_zip64_and_reads_independently() {
+        let entries = [CreateEntry {
+            name: "hello".into(),
+            data: b"payload".to_vec(),
+            kind: EntryKind::File,
+        }];
+        let mut output = SparseIo::default();
+        let start = u64::from(u32::MAX);
+        output.seek(SeekFrom::Start(start)).unwrap();
+        create_readers(
+            &entries,
+            &mut |_| Ok(Box::new(Cursor::new(b"payload"))),
+            &mut output,
+            None,
+            crate::ZipEncryption::Aes256,
+            None,
+            crate::ZipCompression::Copy,
+        )
+        .unwrap();
+        let indexed = preflight(&mut output, Limits::default()).unwrap();
+        output
+            .seek(SeekFrom::Start(indexed.directory_start))
+            .unwrap();
+        let mut header = [0; 63];
+        output.read_exact(&mut header).unwrap();
+        assert_eq!(u32::from_le_bytes(header[20..24].try_into().unwrap()), 7);
+        assert_eq!(u32::from_le_bytes(header[24..28].try_into().unwrap()), 7);
+        assert_eq!(
+            u32::from_le_bytes(header[42..46].try_into().unwrap()),
+            u32::MAX
+        );
+        assert_eq!(&header[51..55], &[1, 0, 8, 0]);
+        assert_eq!(
+            u64::from_le_bytes(header[55..63].try_into().unwrap()),
+            start
+        );
+        let mut independent = zip::ZipArchive::new(output).unwrap();
+        let mut payload = Vec::new();
+        independent
+            .by_index(0)
+            .unwrap()
+            .read_to_end(&mut payload)
+            .unwrap();
+        assert_eq!(payload, b"payload");
+    }
+
+    #[test]
+    fn small_stored_output_has_classic_headers_and_independent_payload_reading() {
+        let entries = [CreateEntry {
+            name: "hello".into(),
+            data: b"payload".to_vec(),
+            kind: EntryKind::File,
+        }];
+        let mut output = Cursor::new(Vec::new());
+        create_readers(
+            &entries,
+            &mut |_| Ok(Box::new(Cursor::new(b"payload"))),
+            &mut output,
+            None,
+            crate::ZipEncryption::Aes256,
+            None,
+            crate::ZipCompression::Copy,
+        )
+        .unwrap();
+        let bytes = output.into_inner();
+        assert_eq!(u16::from_le_bytes(bytes[28..30].try_into().unwrap()), 0);
+        assert!(!bytes.windows(4).any(|value| value == b"PK\x06\x06"));
+        let mut independent = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut payload = Vec::new();
+        independent
+            .by_index(0)
+            .unwrap()
+            .read_to_end(&mut payload)
+            .unwrap();
+        assert_eq!(payload, b"payload");
+    }
 }

@@ -1,5 +1,95 @@
 # arc
 
+Query the current inventory and editing profile with `arc capabilities --json`.
+The compatibility namespace supports a limited read frontend:
+
+```sh
+arc 7z l input.zip
+arc 7z t input.zip '-i!docs' '-x!docs/*.tmp'
+arc 7z x input.zip -odestination
+arc --json 7z l input.zip
+arc 7z --help
+```
+
+`-tFORMAT`, `-oDIR`, `-i!PATTERN`, `-x!PATTERN`, `-spd`, `-ssc`, `-ssc-`
+and `--` have scoped support. This frontend retains native no-overwrite, resource
+and filesystem policies. Its component wildcards and ASCII-only insensitive
+comparison are explicit compatibility differences; unsupported switches,
+password syntax, listfiles and editing commands fail without echoing their values.
+Native `a` remains create-only.
+
+Native indexed archive list/test/extract share `--include`/`--exclude` selection.
+Patterns use component-local `*`/`?`, with directory descendants matched at `/`
+boundaries. Quote shell wildcards. `--literal-names` disables wildcard syntax;
+`--ignore-ascii-case` folds ASCII letters only. Excludes win. Selected tests report
+`scope: selected-entries`, rather than claiming whole-archive verification. These
+selectors currently reject stdin, package, WIM and optical adapter paths.
+CLI patterns are UTF-8 strings. ZIP/TAR and other byte-name backends match stored
+name bytes; 7z matches its decoded UTF-8 name instead of its UTF-16LE storage bytes.
+The core selection API also accepts raw byte patterns for non-UTF-8 names.
+
+Supported ZIP edits use explicit options:
+
+```sh
+arc rename input.zip --pair old.txt new.txt --dry-run --json
+arc rename input.zip --pair 'old-dir/' 'new-dir/' --output renamed.zip
+arc delete input.zip --name unwanted.txt --verify
+arc deflate --input payload --output payload.gz --compression-level 9 --json
+```
+
+Repeat `--pair OLD NEW` or `--name NAME` for simultaneous operations. Directory
+names end in `/`. Without `--output`, edits replace the admitted source on Unix;
+with it, they publish a new artifact without overwriting. Dry runs validate
+decisions without writing. Edits copy retained compressed/encrypted bytes exactly
+and require no password by default; `payloads_verified: false` makes that explicit.
+`--verify` decodes every retained payload and requires `--password-file` for
+encrypted archives. Unknown extras, unsupported codecs/layouts and package or
+signature markers fail before publication. The original survives pre-publication
+failure or cancellation. Publication preserves source permissions; inode identity
+and other filesystem metadata are not retained. Cooperative parent-directory
+locking and source identity checks detect conflicts, but cannot provide a universal
+compare-and-swap against uncooperative writers. Windows publication remains
+unavailable. A directory-sync failure after publication is reported as published
+with `directory_synced: false`, because the rename already occurred.
+
+ZIP and 7z modification times and encryption can also be edited:
+
+```sh
+arc edit input.zip --name document.txt --modified-unix-seconds 1700000001
+arc edit input.zip --name document.txt --encrypt --new-password-file new-password
+arc edit input.zip --name document.txt --encrypt --password-file old-password --new-password-file new-password
+arc edit input.7z --encrypt --encrypt-headers --new-password-file new-password
+arc edit input.7z --decrypt --password-file old-password --output plain.7z
+```
+
+Repeat `--name` to select entries; omit it to select the entire archive. Trailing
+`/` selects directory descendants. Timestamp and encryption changes can be combined.
+`--output`, `--dry-run`, and `--verify` follow the publication rules above. Password
+files supply password bytes (7z requires UTF-8); one trailing line ending is removed. Credentials never
+appear in decisions or reports. Encryption uses AES-256 and fresh OS randomness.
+
+ZIP timestamps store authoritative Unix seconds (0–4294967295), update existing
+NTFS modification times, and use a deterministic UTC-derived DOS fallback clamped
+before 1980. Access/creation times are retained. 7z timestamps store checked
+FILETIME seconds while preserving untouched raw time fields and precision.
+Encryption changes verify affected source payloads, then transform their compressed
+streams without recompressing. Unselected ciphertext is retained exactly; `--verify`
+also checks all retained payloads. Native preflight validates the operation before
+creating provisional output; 7z preflight repeats the bounded transform.
+
+ZIP permits a password change for one file; filenames remain visible. 7z passwords
+apply to complete compression groups. A strict subset of a solid group is rejected;
+a non-solid file can be changed independently with unencrypted headers. Partial
+password changes with encrypted headers are rejected because separate header/payload
+credentials are not exposed. Explicitly selected empty 7z entries have no encrypted
+payload and are rejected for payload encryption; whole-archive operations count them
+separately. `--encrypt-headers` requires whole-archive 7z encryption. Whole-archive
+`--decrypt` removes payload and filename encryption; selected decryption preserves
+header encryption. These restrictions are checked before publication.
+
+ZIP add/update and other container editing remain planned. DEFLATE effort applies
+to `arc deflate` only and its effective setting is included in JSON output.
+
 Native archive and read-only Windows package operations:
 
 ```text

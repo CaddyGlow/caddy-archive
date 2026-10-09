@@ -107,7 +107,7 @@ fn gzip_truncation_is_rejected() {
     ));
 }
 #[test]
-fn zip64_writer_is_readable_by_independent_container_parser() {
+fn zip_writer_is_readable_by_independent_container_parser() {
     let mut output = Cursor::new(Vec::new());
     create(Format::Zip, &entries(), &mut output, Limits::default()).unwrap();
     let zip = zip::ZipArchive::new(Cursor::new(output.into_inner())).unwrap();

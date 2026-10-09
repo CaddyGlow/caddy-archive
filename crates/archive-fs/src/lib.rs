@@ -1,6 +1,8 @@
 //! Native archive extraction with strict names and verified publication.
 /// Version of this library, as declared in `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Adjacent provisional output and guarded native archive publication.
+pub mod update;
 
 use std::{collections::BTreeSet, io, path::Path};
 

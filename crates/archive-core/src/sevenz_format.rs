@@ -114,6 +114,10 @@ pub(crate) struct SevenArchive {
     pack_offsets: Vec<u64>,
     pack_sizes: Vec<u64>,
     pack_crcs: Vec<Option<u32>>,
+    file_properties: Vec<(u8, Vec<u8>)>,
+    archive_properties: Vec<(u8, Vec<u8>)>,
+    header_encrypted: bool,
+    header_pack_ranges: Vec<(u64, u64)>,
 }
 
 pub(crate) struct Password {
@@ -514,6 +518,7 @@ fn files(h: &mut Header<'_>, archive: &mut SevenArchive) -> Result<()> {
         }
         let length = h.count(h.limits.max_metadata_bytes)?;
         let bytes = h.take(length)?;
+        archive.file_properties.push((property, bytes.to_vec()));
         let mut p = Header {
             bytes,
             position: 0,
@@ -715,6 +720,8 @@ impl SevenArchive {
             }
             return Ok(Self::default());
         }
+        let mut header_encrypted = false;
+        let mut header_pack_ranges = Vec::new();
         for _ in 0..password.limits.max_nesting_depth.min(16) {
             let mut h = Header {
                 bytes: &bytes,
@@ -728,6 +735,7 @@ impl SevenArchive {
                         return Err(Error::Unsupported("multi-folder 7z encoded header".into()));
                     }
                     let f = &encoded.blocks[0];
+                    header_encrypted |= f.coders.iter().any(|coder| coder.method == AES);
                     if f.get_unpack_size() > password.limits.max_metadata_bytes {
                         return Err(Error::ResourceLimit("7z decoded header bytes"));
                     }
@@ -735,6 +743,13 @@ impl SevenArchive {
                         return Err(malformed("7z encoded header termination"));
                     }
                     validate_extents(&encoded, position)?;
+                    header_pack_ranges.extend(
+                        encoded
+                            .pack_offsets
+                            .iter()
+                            .copied()
+                            .zip(encoded.pack_sizes.iter().copied()),
+                    );
                     let mut decoded = Vec::new();
                     let mut stream = folder_reader(reader, &encoded, 0, password)?;
                     copy_exact(&mut stream, &mut decoded, f.get_unpack_size())?;
@@ -742,6 +757,7 @@ impl SevenArchive {
                 }
                 1 => {
                     let mut archive = SevenArchive::default();
+                    let mut archive_properties = Vec::new();
                     let mut property = h.byte()?;
                     if property == 2 {
                         loop {
@@ -750,7 +766,7 @@ impl SevenArchive {
                                 break;
                             }
                             let n = h.count(h.limits.max_metadata_bytes)?;
-                            h.take(n)?;
+                            archive_properties.push((p, h.take(n)?.to_vec()));
                         }
                         property = h.byte()?;
                     }
@@ -769,6 +785,9 @@ impl SevenArchive {
                         return Err(malformed("7z header termination"));
                     }
                     validate_extents(&archive, position)?;
+                    archive.archive_properties = archive_properties;
+                    archive.header_encrypted = header_encrypted;
+                    archive.header_pack_ranges = header_pack_ranges;
                     return Ok(archive);
                 }
                 _ => return Err(malformed("7z header kind")),
@@ -1478,13 +1497,22 @@ struct EncryptWriter<W> {
 #[cfg(feature = "crypto")]
 impl<W: Write> EncryptWriter<W> {
     fn new(output: W, options: &mut CreateOptions<'_>, limits: Limits) -> Result<(Self, Coder)> {
-        use aes::cipher::KeyIvInit;
-        let text = std::str::from_utf8(options.password.ok_or(Error::PasswordRequired)?)
-            .map_err(|_| Error::Unsupported("7z password must be UTF-8 text".into()))?;
+        let password = options.password.ok_or(Error::PasswordRequired)?;
         let random = options
             .randomness
             .as_mut()
             .ok_or_else(|| Error::Unsupported("7z encryption requires random provider".into()))?;
+        Self::with_password(output, password, &mut **random, limits)
+    }
+    fn with_password(
+        output: W,
+        password: &[u8],
+        random: &mut dyn crate::RandomSource,
+        limits: Limits,
+    ) -> Result<(Self, Coder)> {
+        use aes::cipher::KeyIvInit;
+        let text = std::str::from_utf8(password)
+            .map_err(|_| Error::Unsupported("7z password must be UTF-8 text".into()))?;
         let mut props = vec![19 | 0xc0, 255];
         let mut random_bytes = [0; 32];
         random.fill(&mut random_bytes)?;
@@ -1940,6 +1968,706 @@ pub(crate) fn write_readers<'a, E: crate::CreationEntry, W: Write + Seek>(
     Ok(())
 }
 
+// Editing serializes parsed graphs/substream metadata while preserving all raw
+// file/archive properties. It never lowers existing payloads into CreateEntry.
+fn edit_digests(out: &mut Vec<u8>, values: &[Option<u32>]) {
+    if values.iter().all(Option::is_some) {
+        out.push(1);
+    } else {
+        out.push(0);
+        bits(out, &values.iter().map(Option::is_some).collect::<Vec<_>>());
+    }
+    for value in values.iter().flatten() {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn edit_streams(out: &mut Vec<u8>, archive: &SevenArchive) {
+    out.push(6);
+    number(out, 0);
+    number(out, archive.pack_sizes.len() as u64);
+    out.push(9);
+    for size in &archive.pack_sizes {
+        number(out, *size);
+    }
+    out.push(10);
+    edit_digests(out, &archive.pack_crcs);
+    out.extend_from_slice(&[0, 7, 11]);
+    number(out, archive.blocks.len() as u64);
+    out.push(0);
+    for folder in &archive.blocks {
+        number(out, folder.coders.len() as u64);
+        for coder in &folder.coders {
+            out.push(
+                coder.method.len() as u8
+                    | if coder.props.is_empty() { 0 } else { 0x20 }
+                    | if coder.inputs == 1 { 0 } else { 0x10 },
+            );
+            out.extend_from_slice(&coder.method);
+            if coder.inputs != 1 {
+                number(out, coder.inputs as u64);
+                number(out, 1);
+            }
+            if !coder.props.is_empty() {
+                number(out, coder.props.len() as u64);
+                out.extend_from_slice(&coder.props);
+            }
+        }
+        for &(input, output) in &folder.bindings {
+            number(out, input as u64);
+            number(out, output as u64);
+        }
+        if folder.packed_inputs.len() > 1 {
+            for input in &folder.packed_inputs {
+                number(out, *input as u64);
+            }
+        }
+    }
+    out.push(12);
+    for folder in &archive.blocks {
+        for size in &folder.unpack_sizes {
+            number(out, *size);
+        }
+    }
+    out.push(10);
+    edit_digests(
+        out,
+        &archive
+            .blocks
+            .iter()
+            .map(|folder| folder.crc)
+            .collect::<Vec<_>>(),
+    );
+    out.extend_from_slice(&[0, 8, 13]);
+    for folder in &archive.blocks {
+        number(out, folder.sizes.len() as u64);
+    }
+    out.push(9);
+    for folder in &archive.blocks {
+        for size in folder
+            .sizes
+            .iter()
+            .take(folder.sizes.len().saturating_sub(1))
+        {
+            number(out, *size);
+        }
+    }
+    out.push(10);
+    let crcs = archive
+        .blocks
+        .iter()
+        .flat_map(|folder| {
+            if folder.sizes.len() == 1 && folder.crc.is_some() {
+                &[][..]
+            } else {
+                folder.file_crcs.as_slice()
+            }
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    edit_digests(out, &crcs);
+    out.extend_from_slice(&[0, 0]);
+}
+
+fn edit_modified_property(
+    archive: &mut SevenArchive,
+    changes: &[Option<u64>],
+    limits: Limits,
+) -> Result<()> {
+    if changes.iter().all(Option::is_none) {
+        return Ok(());
+    }
+    let existing = archive.file_properties.iter().find(|(id, _)| *id == 20);
+    let mut values = vec![None; archive.files.len()];
+    if let Some((_, bytes)) = existing {
+        let mut header = Header {
+            bytes,
+            position: 0,
+            limits,
+        };
+        let defined = if header.byte()? != 0 {
+            vec![true; values.len()]
+        } else {
+            header.bits(values.len())?
+        };
+        if header.byte()? != 0 {
+            return Err(Error::Unsupported("external 7z edit timestamps".into()));
+        }
+        for (index, defined) in defined.into_iter().enumerate() {
+            if defined {
+                values[index] = Some(u64::from_le_bytes(
+                    header
+                        .take(8)?
+                        .try_into()
+                        .map_err(|_| malformed("7z edit timestamp"))?,
+                ));
+            }
+        }
+    }
+    for (value, change) in values.iter_mut().zip(changes) {
+        if let Some(seconds) = change {
+            *value = Some(
+                seconds
+                    .checked_mul(10_000_000)
+                    .and_then(|ticks| ticks.checked_add(116_444_736_000_000_000))
+                    .ok_or(Error::ResourceLimit("7z edit FILETIME range"))?,
+            );
+        }
+    }
+    let mut bytes = vec![0];
+    bits(
+        &mut bytes,
+        &values.iter().map(Option::is_some).collect::<Vec<_>>(),
+    );
+    bytes.push(0);
+    for value in values.into_iter().flatten() {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    if let Some((_, old)) = archive.file_properties.iter_mut().find(|(id, _)| *id == 20) {
+        *old = bytes;
+    } else {
+        archive.file_properties.push((20, bytes));
+    }
+    Ok(())
+}
+
+fn edit_header(archive: &SevenArchive, limits: Limits) -> Result<Vec<u8>> {
+    let mut header = vec![1];
+    if !archive.archive_properties.is_empty() {
+        header.push(2);
+        for (id, value) in &archive.archive_properties {
+            property(&mut header, *id, value);
+        }
+        header.push(0);
+    }
+    if !archive.blocks.is_empty() {
+        header.push(4);
+        edit_streams(&mut header, archive);
+    }
+    header.push(5);
+    number(&mut header, archive.files.len() as u64);
+    for (id, value) in &archive.file_properties {
+        property(&mut header, *id, value);
+    }
+    if archive.files.is_empty() && archive.file_properties.is_empty() {
+        property(&mut header, 17, &[0]);
+    }
+    header.extend_from_slice(&[0, 0]);
+    if header.len() as u64 > limits.max_metadata_bytes {
+        return Err(Error::ResourceLimit("7z edited header bytes"));
+    }
+    Ok(header)
+}
+
+fn edit_boundary_aes(folder: &Folder) -> Result<Option<usize>> {
+    if folder.packed_inputs.len() != 1 || folder.coders.iter().any(|coder| coder.inputs != 1) {
+        return Err(Error::Unsupported(
+            "7z encryption editing requires one packed stream and single-input coders".into(),
+        ));
+    }
+    let aes = folder
+        .coders
+        .iter()
+        .enumerate()
+        .filter(|(_, coder)| coder.method == AES)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    match aes.as_slice() {
+        [] => Ok(None),
+        [index] if folder.packed_inputs[0] == *index => Ok(Some(*index)),
+        _ => Err(Error::Unsupported(
+            "7z encryption editing requires AES at the packed boundary".into(),
+        )),
+    }
+}
+
+#[cfg(feature = "crypto")]
+fn edit_remove_aes(folder: &mut Folder, index: usize) -> Result<()> {
+    if folder.coders.len() == 1 {
+        folder.coders[0] = Coder {
+            method: COPY.to_vec(),
+            props: Vec::new(),
+            inputs: 1,
+        };
+        return Ok(());
+    }
+    let consumer = folder
+        .bindings
+        .iter()
+        .find(|(_, output)| *output == index)
+        .map(|(input, _)| *input)
+        .ok_or_else(|| malformed("7z AES boundary binding"))?;
+    folder.coders.remove(index);
+    folder.unpack_sizes.remove(index);
+    folder.bindings.retain(|(_, output)| *output != index);
+    for (input, output) in &mut folder.bindings {
+        if *input > index {
+            *input -= 1;
+        }
+        if *output > index {
+            *output -= 1;
+        }
+    }
+    folder.packed_inputs[0] = consumer - usize::from(consumer > index);
+    Ok(())
+}
+
+pub(crate) fn edit_archive<R: Read + Seek, W: Write + Seek>(
+    source: &mut R,
+    output: &mut W,
+    operations: &[crate::sevenz_edit::EditOperation],
+    options: crate::sevenz_edit::EditOptions<'_>,
+    limits: Limits,
+) -> Result<crate::sevenz_edit::EditReport> {
+    use crate::sevenz_edit::{EditOperation, EditReport, EncryptionMode};
+    #[cfg(feature = "crypto")]
+    let mut options = options;
+    let source_length = source.seek(SeekFrom::End(0))?;
+    if source_length > limits.max_input_bytes {
+        return Err(Error::ResourceLimit("7z edit input bytes"));
+    }
+    if output.seek(SeekFrom::End(0))? != 0 {
+        return Err(Error::Unsupported(
+            "7z edit requires empty provisional output".into(),
+        ));
+    }
+    source.seek(SeekFrom::Start(0))?;
+    let mut old_password = if let Some(bytes) = options.old_password {
+        Password::new(
+            std::str::from_utf8(bytes)
+                .map_err(|_| Error::Unsupported("7z password must be UTF-8 text".into()))?,
+        )
+    } else {
+        Password::empty()
+    };
+    old_password.limits = limits;
+    let mut archive = SevenArchive::read(source, &old_password)?;
+    let original = archive.clone();
+    source.seek(SeekFrom::Start(0))?;
+    let mut start = [0u8; 32];
+    source.read_exact(&mut start)?;
+    let end = 32u64
+        .checked_add(u64::from_le_bytes(
+            start[12..20]
+                .try_into()
+                .map_err(|_| malformed("7z edit offset"))?,
+        ))
+        .and_then(|offset| {
+            offset.checked_add(u64::from_le_bytes(
+                start[20..28].try_into().unwrap_or([0; 8]),
+            ))
+        })
+        .ok_or(Error::ResourceLimit("7z edit header extent"))?;
+    if end != source_length {
+        return Err(Error::Unsupported("7z edit trailing data".into()));
+    }
+    let mut next = 32u64;
+    for (offset, size) in archive.pack_offsets.iter().zip(&archive.pack_sizes) {
+        if *offset != next {
+            return Err(Error::Unsupported("7z edit packed gaps/prefix".into()));
+        }
+        next = next
+            .checked_add(*size)
+            .ok_or(Error::ResourceLimit("7z edit packed extent"))?;
+    }
+    let mut header_ranges = archive.header_pack_ranges.clone();
+    header_ranges.sort_unstable();
+    for (offset, size) in header_ranges {
+        if offset != next {
+            return Err(Error::Unsupported("7z edit header gaps/overlap".into()));
+        }
+        next = next
+            .checked_add(size)
+            .ok_or(Error::ResourceLimit("7z edit header extent"))?;
+    }
+    let next_header_position = 32u64
+        .checked_add(u64::from_le_bytes(
+            start[12..20]
+                .try_into()
+                .map_err(|_| malformed("7z edit offset"))?,
+        ))
+        .ok_or(Error::ResourceLimit("7z edit header position"))?;
+    if next != next_header_position {
+        return Err(Error::Unsupported("7z edit unknown reserved data".into()));
+    }
+    let mut properties = std::collections::BTreeSet::new();
+    for (id, _) in &archive.file_properties {
+        if !properties.insert(*id) && *id != 25 {
+            return Err(Error::Unsupported(
+                "7z edit duplicate file properties".into(),
+            ));
+        }
+    }
+    let mut names = std::collections::BTreeMap::new();
+    let mut total = 0u64;
+    for (index, file) in archive.files.iter().enumerate() {
+        if names.insert(file.name.as_str(), index).is_some() {
+            return Err(malformed("duplicate 7z edit name"));
+        }
+        if file.size > limits.max_entry_bytes {
+            return Err(Error::ResourceLimit("7z edit entry bytes"));
+        }
+        total = total
+            .checked_add(file.size)
+            .ok_or(Error::ResourceLimit("7z edit decoded bytes"))?;
+        if total > limits.max_total_bytes {
+            return Err(Error::ResourceLimit("7z edit decoded bytes"));
+        }
+    }
+    if operations.len() as u64 > limits.max_entries {
+        return Err(Error::ResourceLimit("7z edit operations"));
+    }
+    let mut modified = vec![None; archive.files.len()];
+    let mut encryption = vec![None; archive.files.len()];
+    let mut entries_without_payload = 0;
+    for operation in operations {
+        let name = match operation {
+            EditOperation::SetModified { name, .. } | EditOperation::SetEncryption { name, .. } => {
+                name
+            }
+        };
+        let targets: Vec<_> = if let Some(name) = name {
+            vec![
+                *names
+                    .get(name.as_str())
+                    .ok_or_else(|| malformed("7z edit target missing"))?,
+            ]
+        } else {
+            (0..archive.files.len()).collect()
+        };
+        for index in targets {
+            match operation {
+                EditOperation::SetModified {
+                    modified_unix_seconds,
+                    ..
+                } => {
+                    if modified[index].replace(*modified_unix_seconds).is_some() {
+                        return Err(malformed("duplicate 7z timestamp edit"));
+                    }
+                }
+                EditOperation::SetEncryption { mode, .. } => {
+                    if !archive.files[index].has_stream {
+                        if name.is_some() {
+                            return Err(Error::Unsupported(
+                                "7z empty entry has no payload encryption; use header encryption"
+                                    .into(),
+                            ));
+                        }
+                        entries_without_payload += 1;
+                        continue;
+                    }
+                    if encryption[index].replace(*mode).is_some() {
+                        return Err(malformed("duplicate 7z encryption edit"));
+                    }
+                }
+            }
+        }
+    }
+    drop(names);
+    edit_modified_property(&mut archive, &modified, limits)?;
+    let mut actions = Vec::with_capacity(archive.blocks.len());
+    let mut encryption_entries = 0u64;
+    for (index, folder) in archive.blocks.iter().enumerate() {
+        let members: Vec<_> = archive
+            .stream_map
+            .file_block_index
+            .iter()
+            .enumerate()
+            .filter_map(|(file, mapped)| (*mapped == Some(index)).then_some(file))
+            .collect();
+        let requested = members.iter().find_map(|file| encryption[*file]);
+        if let Some(mode) = requested {
+            if members.iter().any(|file| encryption[*file] != Some(mode)) {
+                return Err(Error::Unsupported(
+                    "7z encryption edit selects a strict subset of a solid folder".into(),
+                ));
+            }
+            let aes = edit_boundary_aes(folder)?;
+            if mode == EncryptionMode::Decrypt && aes.is_none() {
+                actions.push(None);
+                continue;
+            }
+            if aes.is_some() && options.old_password.is_none() {
+                return Err(Error::PasswordRequired);
+            }
+            if mode == EncryptionMode::Encrypt && options.new_password.is_none() {
+                return Err(Error::PasswordRequired);
+            }
+            if folder.crc.is_none() && folder.file_crcs.iter().any(Option::is_none) {
+                return Err(Error::Unsupported(
+                    "7z encryption transform requires decoded CRC evidence".into(),
+                ));
+            }
+            actions.push(Some((mode, aes)));
+            encryption_entries += members.len() as u64;
+        } else {
+            actions.push(None);
+        }
+    }
+    let headers_encrypted = options.encrypt_headers.unwrap_or(archive.header_encrypted);
+    let header_password = options.new_password.or(options.old_password);
+    if headers_encrypted && header_password.is_none() {
+        return Err(Error::PasswordRequired);
+    }
+    let encrypting = headers_encrypted
+        || actions
+            .iter()
+            .any(|action| action.is_some_and(|(mode, _)| mode == EncryptionMode::Encrypt));
+    if encrypting {
+        #[cfg(not(feature = "crypto"))]
+        return Err(Error::Unsupported("7z crypto feature unavailable".into()));
+        #[cfg(feature = "crypto")]
+        {
+            if options.randomness.is_none() {
+                return Err(Error::Unsupported(
+                    "7z encryption editing requires random provider".into(),
+                ));
+            }
+            if limits.max_active_workspace_bytes < 128 * 1024 {
+                return Err(Error::ResourceLimit("7z encryption edit workspace"));
+            }
+            if limits.max_password_iterations < (1 << 19) {
+                return Err(Error::ResourceLimit("7z encryption edit password work"));
+            }
+        }
+    }
+    if headers_encrypted
+        && header_password != options.old_password
+        && archive.blocks.iter().zip(&actions).any(|(folder, action)| {
+            action.is_none() && folder.coders.iter().any(|coder| coder.method == AES)
+        })
+    {
+        return Err(Error::Unsupported(
+            "7z mixed payload/header passwords require unencrypted headers".into(),
+        ));
+    }
+    for bytes in [options.new_password, header_password]
+        .into_iter()
+        .flatten()
+    {
+        std::str::from_utf8(bytes)
+            .map_err(|_| Error::Unsupported("7z password must be UTF-8 text".into()))?;
+    }
+    // Validate output header size and all transformed source folder credentials
+    // before publication of even a provisional start header.
+    let projected = archive.clone();
+    #[cfg(feature = "crypto")]
+    let mut projected = projected;
+    for (index, action) in actions.iter().enumerate() {
+        if let Some((mode, aes)) = action {
+            #[cfg(feature = "crypto")]
+            {
+                let folder = &mut projected.blocks[index];
+                let plain_size = aes.map_or(original.pack_sizes[folder.pack_indices[0]], |aes| {
+                    folder.unpack_sizes[aes]
+                });
+                if let Some(aes) = aes {
+                    edit_remove_aes(folder, *aes)?;
+                }
+                if *mode == EncryptionMode::Encrypt {
+                    if folder.coders.len() >= 32 {
+                        return Err(Error::Unsupported("7z edited coder count".into()));
+                    }
+                    let new_index = folder.coders.len();
+                    folder.bindings.push((folder.packed_inputs[0], new_index));
+                    folder.packed_inputs[0] = new_index;
+                    folder.coders.push(Coder {
+                        method: AES.to_vec(),
+                        props: vec![0; 34],
+                        inputs: 1,
+                    });
+                    folder.unpack_sizes.push(plain_size);
+                    projected.pack_sizes[folder.pack_indices[0]] = plain_size
+                        .checked_add(15)
+                        .ok_or(Error::ResourceLimit("7z encrypted stream size"))?
+                        / 16
+                        * 16;
+                } else {
+                    projected.pack_sizes[folder.pack_indices[0]] = plain_size;
+                }
+                projected.pack_crcs[folder.pack_indices[0]] = Some(0);
+            }
+            #[cfg(not(feature = "crypto"))]
+            {
+                let _ = (index, mode, aes);
+                return Err(Error::Unsupported("7z crypto feature unavailable".into()));
+            }
+        }
+    }
+    let projected_header = edit_header(&projected, limits)?;
+    if headers_encrypted {
+        let pack = (projected_header.len() as u64)
+            .checked_add(15)
+            .ok_or(Error::ResourceLimit("7z edited header size"))?
+            / 16
+            * 16;
+        let position = projected.pack_sizes.iter().try_fold(0u64, |total, size| {
+            total
+                .checked_add(*size)
+                .ok_or(Error::ResourceLimit("7z edited pack bytes"))
+        })?;
+        let mut wrapper = vec![23];
+        let info = WrittenFolder {
+            coders: vec![Coder {
+                method: AES.to_vec(),
+                props: vec![0; 34],
+                inputs: 1,
+            }],
+            sizes: vec![projected_header.len() as u64],
+            crc: 0,
+            pack,
+            pack_crc: 0,
+        };
+        write_streams(&mut wrapper, &[info], position);
+        if wrapper.len() as u64 > limits.max_metadata_bytes {
+            return Err(Error::ResourceLimit("7z edited encoded header bytes"));
+        }
+    }
+    for (index, action) in actions.iter().enumerate() {
+        if action.is_some() {
+            for_folder(source, &original, index, &old_password, &mut |_, reader| {
+                let mut buffer = [0; 65536];
+                while reader.read(&mut buffer)? != 0 {}
+                Ok(true)
+            })?;
+        }
+    }
+    output.seek(SeekFrom::Start(0))?;
+    output.write_all(&[0; 32])?;
+    let mut copied = 0u64;
+    let transformed = 0u64;
+    #[cfg(feature = "crypto")]
+    let mut transformed = transformed;
+    for (index, action) in actions.iter().enumerate() {
+        if let Some((mode, aes)) = action {
+            #[cfg(feature = "crypto")]
+            {
+                let old_folder = &original.blocks[index];
+                let pack = old_folder.pack_indices[0];
+                source.seek(SeekFrom::Start(original.pack_offsets[pack]))?;
+                let packed = Box::new(source.by_ref().take(original.pack_sizes[pack]));
+                let plain_size = aes.map_or(original.pack_sizes[pack], |aes| {
+                    old_folder.unpack_sizes[aes]
+                });
+                let mut input: Box<dyn Read + '_> = if let Some(aes) = aes {
+                    decrypt_reader(packed, &old_folder.coders[*aes].props, &old_password)?
+                } else {
+                    packed
+                };
+                let mut packed_output = OutputStats::new(&mut *output);
+                let folder = &mut archive.blocks[index];
+                if let Some(aes) = aes {
+                    edit_remove_aes(folder, *aes)?;
+                }
+                if *mode == EncryptionMode::Encrypt {
+                    let random = options.randomness.as_mut().ok_or_else(|| {
+                        Error::Unsupported("7z encryption editing requires random provider".into())
+                    })?;
+                    let (mut encrypted, coder) = EncryptWriter::with_password(
+                        &mut packed_output,
+                        options.new_password.ok_or(Error::PasswordRequired)?,
+                        &mut **random,
+                        limits,
+                    )?;
+                    copy_exact(
+                        &mut input.by_ref().take(plain_size),
+                        &mut encrypted,
+                        plain_size,
+                    )?;
+                    encrypted.finish()?;
+                    let new_index = folder.coders.len();
+                    folder.bindings.push((folder.packed_inputs[0], new_index));
+                    folder.packed_inputs[0] = new_index;
+                    folder.coders.push(coder);
+                    folder.unpack_sizes.push(plain_size);
+                } else {
+                    copy_exact(
+                        &mut input.by_ref().take(plain_size),
+                        &mut packed_output,
+                        plain_size,
+                    )?;
+                }
+                archive.pack_sizes[pack] = packed_output.bytes;
+                archive.pack_crcs[pack] = Some(packed_output.crc);
+                transformed += original.pack_sizes[pack];
+            }
+            #[cfg(not(feature = "crypto"))]
+            {
+                let _ = (mode, aes);
+                return Err(Error::Unsupported("7z crypto feature unavailable".into()));
+            }
+        } else {
+            for &pack in &original.blocks[index].pack_indices {
+                source.seek(SeekFrom::Start(original.pack_offsets[pack]))?;
+                copy_exact(
+                    &mut source.by_ref().take(original.pack_sizes[pack]),
+                    output,
+                    original.pack_sizes[pack],
+                )?;
+                copied += original.pack_sizes[pack];
+            }
+        }
+    }
+    let header = edit_header(&archive, limits)?;
+    #[cfg(feature = "crypto")]
+    let mut header = header;
+    if headers_encrypted {
+        #[cfg(feature = "crypto")]
+        {
+            let unpack = header.len() as u64;
+            let crc = crc32(0, &header);
+            let position = output
+                .stream_position()?
+                .checked_sub(32)
+                .ok_or_else(|| malformed("7z edit position"))?;
+            let mut packed = OutputStats::new(&mut *output);
+            let random = options.randomness.as_mut().ok_or_else(|| {
+                Error::Unsupported("7z encryption editing requires random provider".into())
+            })?;
+            let (mut encrypted, coder) = EncryptWriter::with_password(
+                &mut packed,
+                header_password.ok_or(Error::PasswordRequired)?,
+                &mut **random,
+                limits,
+            )?;
+            encrypted.write_all(&header)?;
+            encrypted.finish()?;
+            let info = WrittenFolder {
+                coders: vec![coder],
+                sizes: vec![unpack],
+                crc,
+                pack: packed.bytes,
+                pack_crc: packed.crc,
+            };
+            header = vec![23];
+            write_streams(&mut header, &[info], position);
+        }
+        #[cfg(not(feature = "crypto"))]
+        return Err(Error::Unsupported("7z crypto feature unavailable".into()));
+    }
+    let position = output.stream_position()?;
+    output.write_all(&header)?;
+    let mut start = Vec::new();
+    start.extend_from_slice(&(position - 32).to_le_bytes());
+    start.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    start.extend_from_slice(&crc32(0, &header).to_le_bytes());
+    output.seek(SeekFrom::Start(0))?;
+    output.write_all(&SIGNATURE)?;
+    output.write_all(&[0, 4])?;
+    output.write_all(&crc32(0, &start).to_le_bytes())?;
+    output.write_all(&start)?;
+    Ok(EditReport {
+        retained_entries: archive.files.len() as u64,
+        timestamp_entries: modified.iter().filter(|value| value.is_some()).count() as u64,
+        encryption_entries,
+        entries_without_payload,
+        packed_bytes_copied: copied,
+        packed_bytes_transformed: transformed,
+        payloads_verified: actions.iter().all(Option::is_some),
+        headers_encrypted,
+    })
+}
+
 #[cfg(all(test, feature = "brotli"))]
 mod brotli_tests {
     use super::*;
@@ -1993,5 +2721,339 @@ mod brotli_tests {
         };
         let mut reader = BrotliReader::new(Box::new(io::Cursor::new(pair)), limits).unwrap();
         assert!(reader.read_to_end(&mut Vec::new()).is_err());
+    }
+}
+
+#[cfg(all(test, feature = "crypto"))]
+mod edit_tests {
+    use super::*;
+    use crate::sevenz_edit::{EditOperation, EditOptions, EncryptionMode};
+    use std::io::Cursor;
+
+    struct TestRandom(u8);
+    impl crate::RandomSource for TestRandom {
+        fn fill(&mut self, bytes: &mut [u8]) -> Result<()> {
+            for byte in bytes {
+                self.0 = self.0.wrapping_add(1);
+                *byte = self.0;
+            }
+            Ok(())
+        }
+    }
+    fn fixture(password: Option<&[u8]>, headers: bool) -> Vec<u8> {
+        let entries = [
+            CreateEntry {
+                name: "first".into(),
+                data: b"FIRST_COMPRESSED_STREAM".repeat(10),
+                kind: EntryKind::File,
+            },
+            CreateEntry {
+                name: "second".into(),
+                data: b"SECOND_COMPRESSED_STREAM".repeat(10),
+                kind: EntryKind::File,
+            },
+        ];
+        let metadata = [
+            crate::EntryMetadata {
+                modified: Some(crate::StoredTimestamp::UnixSeconds(1_700_000_001)),
+                unix_mode: Some(0o100640),
+                ..Default::default()
+            },
+            crate::EntryMetadata {
+                modified: Some(crate::StoredTimestamp::UnixSeconds(1_700_000_002)),
+                unix_mode: Some(0o100600),
+                ..Default::default()
+            },
+        ];
+        let mut output = Cursor::new(Vec::new());
+        write(
+            &entries,
+            &mut output,
+            &mut CreateOptions {
+                password,
+                encrypt_headers: headers,
+                randomness: Some(&mut TestRandom(0)),
+                sevenz_compression: crate::SevenZipCompression::Deflate,
+                entry_metadata: Some(&metadata),
+                ..Default::default()
+            },
+            Limits::default(),
+        )
+        .unwrap();
+        output.into_inner()
+    }
+    fn parsed(bytes: &[u8], password: Option<&[u8]>) -> SevenArchive {
+        let mut password = password.map_or_else(Password::empty, |bytes| {
+            Password::new(std::str::from_utf8(bytes).unwrap())
+        });
+        password.limits = Limits::default();
+        SevenArchive::read(&mut Cursor::new(bytes), &password).unwrap()
+    }
+    fn replace_header(bytes: &[u8], archive: &SevenArchive) -> Vec<u8> {
+        let packed = archive.pack_sizes.iter().sum::<u64>() as usize;
+        let header = edit_header(archive, Limits::default()).unwrap();
+        let mut output = bytes[..32 + packed].to_vec();
+        output.extend_from_slice(&header);
+        output[12..20].copy_from_slice(&(packed as u64).to_le_bytes());
+        output[20..28].copy_from_slice(&(header.len() as u64).to_le_bytes());
+        output[28..32].copy_from_slice(&crc32(0, &header).to_le_bytes());
+        let crc = crc32(0, &output[12..32]);
+        output[8..12].copy_from_slice(&crc.to_le_bytes());
+        output
+    }
+    fn packed<'a>(bytes: &'a [u8], archive: &SevenArchive, index: usize) -> &'a [u8] {
+        &bytes[archive.pack_offsets[index] as usize
+            ..(archive.pack_offsets[index] + archive.pack_sizes[index]) as usize]
+    }
+
+    #[test]
+    fn timestamps_preserve_fractional_unselected_times_all_other_properties_and_packed_graphs() {
+        let initial = fixture(None, false);
+        let mut archive = parsed(&initial, None);
+        let times = archive
+            .file_properties
+            .iter_mut()
+            .find(|(id, _)| *id == 20)
+            .unwrap();
+        let second = times.1.len() - 8;
+        let ticks = u64::from_le_bytes(times.1[second..].try_into().unwrap()) + 1_234_567;
+        times.1[second..].copy_from_slice(&ticks.to_le_bytes());
+        let other_times = times.1.clone();
+        archive.file_properties.push((18, other_times.clone()));
+        archive.file_properties.push((19, other_times));
+        archive.file_properties.push((25, vec![0, 1, 2]));
+        archive.archive_properties.push((0x70, vec![1, 2, 3]));
+        let source = replace_header(&initial, &archive);
+        let mut output = Cursor::new(Vec::new());
+        let report = edit_archive(
+            &mut Cursor::new(&source),
+            &mut output,
+            &[EditOperation::SetModified {
+                name: Some("first".into()),
+                modified_unix_seconds: 1_800_000_000,
+            }],
+            EditOptions::default(),
+            Limits::default(),
+        )
+        .unwrap();
+        let output = output.into_inner();
+        let result = parsed(&output, None);
+        assert_eq!(report.timestamp_entries, 1);
+        assert_eq!(
+            report.packed_bytes_copied,
+            archive.pack_sizes.iter().sum::<u64>()
+        );
+        assert!(!report.payloads_verified);
+        assert_eq!(result.archive_properties, archive.archive_properties);
+        for (id, raw) in &archive.file_properties {
+            if *id != 20 {
+                assert_eq!(
+                    &result
+                        .file_properties
+                        .iter()
+                        .find(|(other, _)| id == other)
+                        .unwrap()
+                        .1,
+                    raw
+                );
+            }
+        }
+        let time = &result
+            .file_properties
+            .iter()
+            .find(|(id, _)| *id == 20)
+            .unwrap()
+            .1;
+        assert_eq!(&time[time.len() - 8..], &ticks.to_le_bytes());
+        assert_eq!(
+            result.files[0].metadata.modified,
+            Some(crate::StoredTimestamp::UnixSeconds(1_800_000_000))
+        );
+        for index in 0..archive.blocks.len() {
+            assert_eq!(
+                packed(&source, &archive, index),
+                packed(&output, &result, index)
+            );
+            assert_eq!(
+                archive.blocks[index].bindings,
+                result.blocks[index].bindings
+            );
+            assert_eq!(
+                archive.blocks[index].unpack_sizes,
+                result.blocks[index].unpack_sizes
+            );
+            for (old, new) in archive.blocks[index]
+                .coders
+                .iter()
+                .zip(&result.blocks[index].coders)
+            {
+                assert_eq!(old.method, new.method);
+                assert_eq!(old.props, new.props);
+            }
+        }
+        let mut indexed = crate::Archive::open(Cursor::new(output), Limits::default()).unwrap();
+        indexed.test().unwrap();
+    }
+
+    #[test]
+    fn rekey_one_folder_preserves_other_ciphertext_and_recovers_original_compressed_stream() {
+        let source = fixture(Some(b"old-pass"), false);
+        let original = parsed(&source, Some(b"old-pass"));
+        let mut output = Cursor::new(Vec::new());
+        let report = edit_archive(
+            &mut Cursor::new(&source),
+            &mut output,
+            &[EditOperation::SetEncryption {
+                name: Some("first".into()),
+                mode: EncryptionMode::Encrypt,
+            }],
+            EditOptions {
+                old_password: Some(b"old-pass"),
+                new_password: Some(b"new-pass"),
+                randomness: Some(&mut TestRandom(64)),
+                ..Default::default()
+            },
+            Limits::default(),
+        )
+        .unwrap();
+        let edited = output.into_inner();
+        let result = parsed(&edited, None);
+        assert_eq!(report.encryption_entries, 1);
+        assert_eq!(packed(&source, &original, 1), packed(&edited, &result, 1));
+        assert_ne!(packed(&source, &original, 0), packed(&edited, &result, 0));
+        let mut new = crate::Archive::open_with_password(
+            Cursor::new(&edited),
+            Limits::default(),
+            b"new-pass",
+        )
+        .unwrap();
+        assert_eq!(
+            new.read_entry(crate::EntryId(0), 1000).unwrap(),
+            b"FIRST_COMPRESSED_STREAM".repeat(10)
+        );
+        let mut old = crate::Archive::open_with_password(
+            Cursor::new(&edited),
+            Limits::default(),
+            b"old-pass",
+        )
+        .unwrap();
+        assert_eq!(
+            old.read_entry(crate::EntryId(1), 1000).unwrap(),
+            b"SECOND_COMPRESSED_STREAM".repeat(10)
+        );
+        let mut decrypted = Cursor::new(Vec::new());
+        edit_archive(
+            &mut Cursor::new(&edited),
+            &mut decrypted,
+            &[EditOperation::SetEncryption {
+                name: Some("first".into()),
+                mode: EncryptionMode::Decrypt,
+            }],
+            EditOptions {
+                old_password: Some(b"new-pass"),
+                ..Default::default()
+            },
+            Limits::default(),
+        )
+        .unwrap();
+        let decrypted = decrypted.into_inner();
+        let decrypted_archive = parsed(&decrypted, None);
+        // The plaintext compression/filter coder and properties are unchanged.
+        let original_codec = original.blocks[0]
+            .coders
+            .iter()
+            .find(|coder| coder.method != AES)
+            .unwrap();
+        assert_eq!(
+            decrypted_archive.blocks[0].coders[0].method,
+            original_codec.method
+        );
+        assert_eq!(
+            decrypted_archive.blocks[0].coders[0].props,
+            original_codec.props
+        );
+        let aes = edit_boundary_aes(&original.blocks[0]).unwrap().unwrap();
+        let mut password = Password::new("old-pass");
+        password.limits = Limits::default();
+        let mut compressed = Vec::new();
+        let mut reader = decrypt_reader(
+            Box::new(Cursor::new(packed(&source, &original, 0))),
+            &original.blocks[0].coders[aes].props,
+            &password,
+        )
+        .unwrap();
+        reader
+            .by_ref()
+            .take(original.blocks[0].unpack_sizes[aes])
+            .read_to_end(&mut compressed)
+            .unwrap();
+        assert_eq!(packed(&decrypted, &decrypted_archive, 0), compressed);
+    }
+
+    #[test]
+    fn wrong_missing_credentials_invalid_ranges_and_empty_payloads_leave_output_empty() {
+        let source = fixture(Some(b"old-pass"), false);
+        for password in [None, Some(b"wrong-pass".as_slice())] {
+            let mut output = Cursor::new(Vec::new());
+            assert!(
+                edit_archive(
+                    &mut Cursor::new(&source),
+                    &mut output,
+                    &[EditOperation::SetEncryption {
+                        name: None,
+                        mode: EncryptionMode::Decrypt
+                    }],
+                    EditOptions {
+                        old_password: password,
+                        ..Default::default()
+                    },
+                    Limits::default()
+                )
+                .is_err()
+            );
+            assert!(output.into_inner().is_empty());
+        }
+        let mut output = Cursor::new(Vec::new());
+        assert!(
+            edit_archive(
+                &mut Cursor::new(&source),
+                &mut output,
+                &[EditOperation::SetModified {
+                    name: None,
+                    modified_unix_seconds: u64::MAX
+                }],
+                EditOptions::default(),
+                Limits::default()
+            )
+            .is_err()
+        );
+        assert!(output.into_inner().is_empty());
+        let mut empty = Cursor::new(Vec::new());
+        write(
+            &[CreateEntry {
+                name: "empty".into(),
+                data: Vec::new(),
+                kind: EntryKind::File,
+            }],
+            &mut empty,
+            &mut CreateOptions::default(),
+            Limits::default(),
+        )
+        .unwrap();
+        let mut output = Cursor::new(Vec::new());
+        assert!(matches!(
+            edit_archive(
+                &mut Cursor::new(empty.into_inner()),
+                &mut output,
+                &[EditOperation::SetEncryption {
+                    name: Some("empty".into()),
+                    mode: EncryptionMode::Encrypt
+                }],
+                EditOptions::default(),
+                Limits::default()
+            ),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(output.into_inner().is_empty());
     }
 }

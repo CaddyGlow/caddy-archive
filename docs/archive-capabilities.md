@@ -8,7 +8,7 @@ borrowed selectors rather than the generic `Archive::open` dispatch.
 
 | Format / feature | Read profile | Write profile / exclusions |
 | --- | --- | --- |
-| ZIP / `zip` | Stored, DEFLATE, ZIP64, descriptors | DEFLATE ZIP64; no Deflate64 or strong/header encryption |
+| ZIP / `zip` | Stored, DEFLATE, ZIP64, descriptors | Stored/DEFLATE; automatic classic/ZIP64 sizing; no Deflate64 or strong/header encryption |
 | ZIP / `crypto` | WinZip AES AE-1/AE-2 128/192/256, ZipCrypto | AES-256 AE-2 or explicitly selected legacy ZipCrypto |
 | TAR / `tar` | USTAR, bounded PAX and GNU long names; link metadata | USTAR/PAX; no sparse/special extraction or link publication |
 | gzip / `gzip` or `streams` | Concatenated members with trailer checks; first member header metadata | Deterministic named gzip; TAR wrapping with `gzip` |
@@ -35,6 +35,22 @@ overrides or equivalent metadata for every backend. See the
 [completion audit](archive-completion-audit.md) for remaining full-plan gates.
 
 ## Budgets and Streaming
+
+The [option inventory](archive-option-inventory.md) separates native support from
+the limited `arc 7z l/t/x` frontend and planned upstream properties.
+[`archive_core::zip_edit`](../crates/archive-core/src/zip_edit.rs) reconstructs a
+supported ZIP into a new artifact using exact retained packed bytes. Rename and
+delete preserve stored metadata, comments and encryption; unknown/name-dependent
+extras, split archives, prefixes, signatures, padding and unsupported codecs fail
+before output. Packed copying validates structure and does not authenticate or
+decode retained payloads. Native `--verify` adds full retained-payload checks.
+`arc capabilities --json` reports the editing profile separately from creation.
+ZIP/7z timestamp and encryption editing is available through `arc edit` and bounded
+Worker APIs. Changed payloads are verified and compressed bytes transformed without
+recompression. ZIP supports independent entry passwords but cannot encrypt names.
+7z can encrypt headers; payload encryption operates on complete compression groups,
+with solid subsets and partial rekeying under encrypted headers explicitly gated.
+ZIP add/update and editing of other formats remain unavailable.
 
 `Limits` bounds input, entry count, metadata, per-entry/total decoded bytes,
 dictionary/workspace, nesting depth, workers, pending output and password

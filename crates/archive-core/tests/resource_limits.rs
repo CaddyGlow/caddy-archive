@@ -51,9 +51,9 @@ fn zip_bomb_declared_size_and_count_limits() {
 fn zip_false_decoded_size_cannot_escape_output_limit() {
     let mut bytes = fixture(Format::Zip);
     let central = bytes.windows(4).position(|v| v == b"PK\x01\x02").unwrap();
-    // Our writer uses ZIP64: the first extra field holds the decoded size.
-    let size = central + 46 + 5 + 4;
-    bytes[size..size + 8].copy_from_slice(&1u64.to_le_bytes());
+    // Small archives carry decoded sizes directly in the central header.
+    let size = central + 24;
+    bytes[size..size + 4].copy_from_slice(&1u32.to_le_bytes());
     let mut archive = Archive::open(Cursor::new(bytes), Limits::default()).unwrap();
     let mut output = Vec::new();
     assert!(matches!(
@@ -67,9 +67,9 @@ fn zip_false_decoded_size_cannot_escape_output_limit() {
 fn zip_overlapping_payloads_rejected_before_extraction() {
     let mut bytes = fixture(Format::Zip);
     let central = bytes.windows(4).position(|v| v == b"PK\x01\x02").unwrap();
-    let size = central + 46 + 5 + 4 + 8;
-    let compressed = u64::from_le_bytes(bytes[size..size + 8].try_into().unwrap());
-    bytes[size..size + 8].copy_from_slice(&(compressed + 1).to_le_bytes());
+    let size = central + 20;
+    let compressed = u32::from_le_bytes(bytes[size..size + 4].try_into().unwrap());
+    bytes[size..size + 4].copy_from_slice(&(compressed + 1).to_le_bytes());
     assert!(
         matches!(Archive::open(Cursor::new(bytes), Limits::default()),
         Err(Error::Malformed(message)) if message == "overlapping ZIP members")

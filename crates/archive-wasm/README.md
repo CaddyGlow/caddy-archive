@@ -46,3 +46,57 @@ node scripts/check-archive-browser.mjs
 
 The static server uses port 8786 and the Chromium observer uses debugging port
 9786 by default. Override the latter with `ARCHIVE_CDP_PORT`.
+
+`edit_zip(bytes, operations_json, max_input_bytes, max_metadata_bytes,
+max_decoded_bytes, max_output_bytes)` returns a new ZIP artifact for rename and
+delete operations. For example, use
+`[{"operation":"rename","from":"old.txt","to":"new.txt"}]` or
+`[{"operation":"delete","name":"old.txt"}]`. Directory operations use names
+ending in `/` and match descendants at path boundaries. Operations refer to
+original names and run simultaneously. Input, operation JSON, archive metadata,
+declared decoded sizes and resulting bytes have explicit budgets.
+
+This initial profile preserves packed bytes, ciphertext, comments, attributes
+and supported timestamp/encryption extras. It rejects split archives, SFX,
+trailing data, duplicate names, unknown/name-dependent extras and unsupported
+codecs before output. It requires no password for packed editing, so success
+provides structural validation and does not authenticate encrypted payloads.
+Open the resulting bytes and test them separately when verification is required.
+
+Run this synchronous call in a dedicated Worker. It has no incremental steps or
+AbortSignal cancellation; terminating that Worker abandons unfinished work.
+Publication remains the caller's responsibility. Editing byte inputs copies the
+result into WASM memory and then across the JavaScript boundary; use the output
+budget to cap allocation. The Worker harness covers unencrypted and AES ZIP
+rename/delete, unchanged packed ciphertext, source preservation and budget errors.
+
+The facade also rejects recognized APPX/MSIX manifests, block maps, bundle
+manifests, package signatures and signed JAR metadata. Those containers need an
+explicit package/signature editing policy. The byte-slice and JSON arguments
+are copied into WASM by generated bindings before Rust can enforce budgets;
+callers must bound those JavaScript inputs before calling, as with `ByteArchive`.
+
+`edit_zip` also accepts `{"operation":"modified","name":"file","modified_unix_seconds":1700000001}`.
+With `crypto`, `edit_zip_with_passwords(bytes, operations_json, old_password,
+new_password, max_input_bytes, max_metadata_bytes, max_decoded_bytes,
+max_output_bytes)` accepts separate optional byte-array credentials. Use
+`{"operation":"encryption","name":"file","encrypted":true}` to encrypt/rekey
+with AES-256, or `false` to decrypt. Source payloads undergoing encryption changes
+are verified; untouched ciphertext is copied exactly. ZIP filenames remain visible.
+
+With `sevenz,crypto`, `edit_7z(bytes, operations_json, old_password, new_password,
+encrypt_headers, max_input_bytes, max_metadata_bytes, max_decoded_bytes,
+max_output_bytes)` accepts the same modified/encryption JSON forms. An omitted
+name selects all entries; named operations require exact decoded names. Header
+policy is an optional boolean: `true` hides names, `false` removes that protection,
+and omission preserves it. Whole compression groups can be transformed without
+recompression. Solid subsets, explicitly selected empty payloads, and partial
+password changes under encrypted headers fail explicitly. Raw untouched 7z
+metadata, including timestamp precision, is preserved.
+
+Both APIs use fresh Web Crypto randomness, keep passwords out of JSON, and clear
+owned WASM credential copies on return. Callers must erase their JS credential
+arrays and bound all JS inputs before generated bindings copy them. Run editing
+in a dedicated Worker and terminate it to cancel. The real browser checks cover
+timestamp changes, rekeying, decryption, wrong passwords and hidden 7z filenames.
+`ByteArchive.entry_metadata_json(id)` exposes stored times and format metadata.

@@ -2,11 +2,318 @@
 /// Version of this library, as declared in `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-use std::io::Cursor;
+use std::io::{Cursor, Seek, SeekFrom, Write};
 
 use archive_core::{Archive, CreateEntry, EntryId, EntryKind, Format, Limits};
 use wasm_bindgen::prelude::*;
 mod range;
+
+/// JSON archive-name operations for the bounded ZIP editing facade.
+#[derive(serde::Deserialize)]
+#[serde(tag = "operation", rename_all = "lowercase", deny_unknown_fields)]
+enum ZipEditOperation {
+    Delete {
+        name: String,
+    },
+    Rename {
+        from: String,
+        to: String,
+    },
+    Modified {
+        name: String,
+        modified_unix_seconds: u64,
+    },
+    Encryption {
+        name: String,
+        encrypted: bool,
+    },
+}
+struct BoundedEditOutput {
+    bytes: Cursor<Vec<u8>>,
+    maximum: u64,
+}
+impl Write for BoundedEditOutput {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let end = self
+            .bytes
+            .position()
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| std::io::Error::other("archive edit output byte budget exceeded"))?;
+        if end > self.maximum {
+            return Err(std::io::Error::other(
+                "archive edit output byte budget exceeded",
+            ));
+        }
+        self.bytes.write(bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.bytes.flush()
+    }
+}
+impl Seek for BoundedEditOutput {
+    fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+        let previous = self.bytes.position();
+        let position = self.bytes.seek(from)?;
+        if position > self.maximum {
+            self.bytes.set_position(previous);
+            return Err(std::io::Error::other(
+                "archive edit output byte budget exceeded",
+            ));
+        }
+        Ok(position)
+    }
+}
+/// Rename/delete ZIP entries into a new bounded byte artifact. JSON operations
+/// use `{"operation":"rename","from":"old","to":"new"}` or
+/// `{"operation":"delete","name":"old"}` in an array. Directory names end
+/// in `/`. The source is borrowed; packed/encrypted bytes are copied without
+/// credentials, decoding or authentication. This synchronous Worker API has no
+/// cooperative cancellation; terminate the Worker to abandon the operation.
+#[wasm_bindgen]
+pub fn edit_zip(
+    bytes: &[u8],
+    operations_json: &str,
+    max_input_bytes: u64,
+    max_metadata_bytes: u64,
+    max_decoded_bytes: u64,
+    max_output_bytes: u64,
+) -> Result<Vec<u8>, JsValue> {
+    edit_zip_inner(
+        bytes,
+        operations_json,
+        None,
+        None,
+        max_input_bytes,
+        max_metadata_bytes,
+        max_decoded_bytes,
+        max_output_bytes,
+    )
+}
+
+/// Edit ZIP timestamps or entry encryption using separately supplied credentials.
+/// Passwords are borrowed byte arrays, never included in JSON operations/reports.
+/// Encryption operations use `{"operation":"encryption","name":"file","encrypted":true}`.
+/// Callers erase their credential arrays after use; Web Crypto supplies fresh randomness.
+#[cfg(feature = "crypto")]
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn edit_zip_with_passwords(
+    bytes: &[u8],
+    operations_json: &str,
+    old_password: Option<Vec<u8>>,
+    new_password: Option<Vec<u8>>,
+    max_input_bytes: u64,
+    max_metadata_bytes: u64,
+    max_decoded_bytes: u64,
+    max_output_bytes: u64,
+) -> Result<Vec<u8>, JsValue> {
+    let old_password = old_password.map(zeroize::Zeroizing::new);
+    let new_password = new_password.map(zeroize::Zeroizing::new);
+    edit_zip_inner(
+        bytes,
+        operations_json,
+        old_password.as_ref().map(|value| value.as_slice()),
+        new_password.as_ref().map(|value| value.as_slice()),
+        max_input_bytes,
+        max_metadata_bytes,
+        max_decoded_bytes,
+        max_output_bytes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn edit_zip_inner(
+    bytes: &[u8],
+    operations_json: &str,
+    old_password: Option<&[u8]>,
+    new_password: Option<&[u8]>,
+    max_input_bytes: u64,
+    max_metadata_bytes: u64,
+    max_decoded_bytes: u64,
+    max_output_bytes: u64,
+) -> Result<Vec<u8>, JsValue> {
+    if bytes.len() as u64 > max_input_bytes {
+        return Err(JsValue::from_str("ZIP edit input byte budget exceeded"));
+    }
+    if operations_json.len() as u64 > max_metadata_bytes {
+        return Err(JsValue::from_str(
+            "ZIP edit operations byte budget exceeded",
+        ));
+    }
+    let operations: Vec<ZipEditOperation> = serde_json::from_str(operations_json)
+        .map_err(|error| JsValue::from_str(&format!("invalid ZIP edit operations: {error}")))?;
+    let operations: Vec<_> = operations
+        .into_iter()
+        .map(|operation| match operation {
+            ZipEditOperation::Delete { name } => {
+                archive_core::zip_edit::EditOperation::Delete { name }
+            }
+            ZipEditOperation::Rename { from, to } => {
+                archive_core::zip_edit::EditOperation::Rename { from, to }
+            }
+            ZipEditOperation::Modified {
+                name,
+                modified_unix_seconds,
+            } => archive_core::zip_edit::EditOperation::SetModified {
+                name,
+                modified_unix_seconds,
+            },
+            ZipEditOperation::Encryption { name, encrypted } => {
+                archive_core::zip_edit::EditOperation::SetEncryption {
+                    name,
+                    encryption: if encrypted {
+                        archive_core::zip_edit::EntryEncryption::Aes256
+                    } else {
+                        archive_core::zip_edit::EntryEncryption::None
+                    },
+                }
+            }
+        })
+        .collect();
+    let limits = Limits {
+        max_input_bytes,
+        max_metadata_bytes,
+        max_entry_bytes: max_decoded_bytes,
+        max_total_bytes: max_decoded_bytes,
+        ..Limits::default()
+    };
+    let mut output = BoundedEditOutput {
+        bytes: Cursor::new(Vec::new()),
+        maximum: max_output_bytes,
+    };
+    let mut input = Cursor::new(bytes);
+    let plan = archive_core::zip_edit::plan(&mut input, &operations, limits)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    if plan
+        .entries()
+        .iter()
+        .any(|entry| zip_package_marker(&entry.original_name))
+    {
+        return Err(JsValue::from_str(
+            "ZIP package/signature editing requires an explicit package policy",
+        ));
+    }
+    #[cfg(feature = "crypto")]
+    let mut randomness = BrowserRandom;
+    let options = archive_core::zip_edit::ZipEditOptions {
+        password: old_password,
+        new_password,
+        #[cfg(feature = "crypto")]
+        randomness: Some(&mut randomness),
+        #[cfg(not(feature = "crypto"))]
+        randomness: None,
+    };
+    archive_core::zip_edit::execute_with_options(&mut input, &mut output, &plan, options, || false)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    Ok(output.bytes.into_inner())
+}
+
+fn zip_package_marker(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "appxmanifest.xml"
+            | "appxblockmap.xml"
+            | "appxsignature.p7x"
+            | ".signature.p7s"
+            | "appxmetadata/appxbundlemanifest.xml"
+    ) || (name.starts_with("meta-inf/")
+        && [".sf", ".rsa", ".dsa", ".ec"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix)))
+}
+
+#[cfg(all(feature = "sevenz", feature = "crypto"))]
+#[derive(serde::Deserialize)]
+#[serde(tag = "operation", rename_all = "lowercase", deny_unknown_fields)]
+enum SevenEditOperation {
+    Modified {
+        name: Option<String>,
+        modified_unix_seconds: u64,
+    },
+    Encryption {
+        name: Option<String>,
+        encrypted: bool,
+    },
+}
+
+/// Reconstruct 7z timestamps and complete compression-group encryption in a Worker.
+/// Names are exact decoded names; an omitted name selects all entries. A selected
+/// subset of a solid group is rejected. `encrypt_headers` explicitly enables or
+/// disables filename encryption; omit it to preserve the existing header policy.
+/// Password buffers are cleared in WASM on return; callers erase their JS arrays.
+#[cfg(all(feature = "sevenz", feature = "crypto"))]
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn edit_7z(
+    bytes: &[u8],
+    operations_json: &str,
+    old_password: Option<Vec<u8>>,
+    new_password: Option<Vec<u8>>,
+    encrypt_headers: Option<bool>,
+    max_input_bytes: u64,
+    max_metadata_bytes: u64,
+    max_decoded_bytes: u64,
+    max_output_bytes: u64,
+) -> Result<Vec<u8>, JsValue> {
+    let old_password = old_password.map(zeroize::Zeroizing::new);
+    let new_password = new_password.map(zeroize::Zeroizing::new);
+    if bytes.len() as u64 > max_input_bytes || operations_json.len() as u64 > max_metadata_bytes {
+        return Err(JsValue::from_str(
+            "7z edit input/operations byte budget exceeded",
+        ));
+    }
+    let operations: Vec<SevenEditOperation> = serde_json::from_str(operations_json)
+        .map_err(|error| JsValue::from_str(&format!("invalid 7z edit operations: {error}")))?;
+    let operations: Vec<_> = operations
+        .into_iter()
+        .map(|operation| match operation {
+            SevenEditOperation::Modified {
+                name,
+                modified_unix_seconds,
+            } => archive_core::sevenz_edit::EditOperation::SetModified {
+                name,
+                modified_unix_seconds,
+            },
+            SevenEditOperation::Encryption { name, encrypted } => {
+                archive_core::sevenz_edit::EditOperation::SetEncryption {
+                    name,
+                    mode: if encrypted {
+                        archive_core::sevenz_edit::EncryptionMode::Encrypt
+                    } else {
+                        archive_core::sevenz_edit::EncryptionMode::Decrypt
+                    },
+                }
+            }
+        })
+        .collect();
+    let limits = Limits {
+        max_input_bytes,
+        max_metadata_bytes,
+        max_entry_bytes: max_decoded_bytes,
+        max_total_bytes: max_decoded_bytes,
+        ..Limits::default()
+    };
+    let mut output = BoundedEditOutput {
+        bytes: Cursor::new(Vec::new()),
+        maximum: max_output_bytes,
+    };
+    let mut randomness = BrowserRandom;
+    archive_core::sevenz_edit::edit(
+        &mut Cursor::new(bytes),
+        &mut output,
+        &operations,
+        archive_core::sevenz_edit::EditOptions {
+            old_password: old_password.as_ref().map(|value| value.as_slice()),
+            new_password: new_password.as_ref().map(|value| value.as_slice()),
+            randomness: Some(&mut randomness),
+            encrypt_headers,
+        },
+        limits,
+    )
+    .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    Ok(output.bytes.into_inner())
+}
 
 /// Indexed archive backed by caller-supplied bytes copied into WASM memory.
 #[wasm_bindgen]
@@ -203,6 +510,17 @@ impl ByteArchive {
             })
             .collect();
         serde_json::to_string(&entries).map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Return stored timestamp and format metadata for one indexed entry.
+    pub fn entry_metadata_json(&mut self, id: usize) -> Result<String, JsValue> {
+        self.archive
+            .entry_metadata(EntryId(id))
+            .and_then(|metadata| {
+                serde_json::to_string(&metadata)
+                    .map_err(|error| archive_core::Error::Malformed(error.to_string()))
+            })
+            .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
     /// Decode one entry with an explicit allocation ceiling.

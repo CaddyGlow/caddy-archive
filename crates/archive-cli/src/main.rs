@@ -1,14 +1,17 @@
 use archive_core::{Archive, CreateEntry, EntryKind, Format, Limits};
+mod archive_edit_operations;
 mod formats;
 mod memory;
 mod optical;
 mod package_compat;
 #[cfg(feature = "progress")]
 mod render_progress;
+mod sevenz_args;
 mod single_file;
 mod staging;
 mod streams;
 mod tar_args;
+mod zip_operations;
 use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(feature = "progress")]
 use render_progress::RenderProgress;
@@ -106,6 +109,18 @@ struct Cli {
     verbose: bool,
     #[arg(short = 'j', long, global = true)]
     json: bool,
+    /// Include archive names matching a '/'-separated wildcard pattern.
+    #[arg(long, global = true)]
+    include: Vec<String>,
+    /// Exclude archive names matching a '/'-separated wildcard pattern.
+    #[arg(long, global = true)]
+    exclude: Vec<String>,
+    /// Treat include/exclude patterns as literal archive names.
+    #[arg(long, global = true)]
+    literal_names: bool,
+    /// Compare ASCII letters case insensitively in include/exclude patterns.
+    #[arg(long, global = true)]
+    ignore_ascii_case: bool,
     #[arg(short = 'p', long, global = true)]
     password_file: Option<PathBuf>,
     #[arg(short = 'b', long, global = true)]
@@ -199,6 +214,71 @@ impl std::str::FromStr for MediaMapping {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Read-only 7-Zip compatibility subset; see 'arc 7z --help' for its supported grammar.
+    #[command(name = "7z", disable_help_flag = true)]
+    Compatibility {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<std::ffi::OsString>,
+    },
+    /// Report native format capabilities and the source-linked compatibility inventory.
+    Capabilities,
+    /// Edit ZIP/7z modification times or encryption using provisional publication.
+    Edit {
+        archive: PathBuf,
+        /// Exact archive name; a trailing '/' includes descendants. Omit to select all entries.
+        #[arg(long = "name", allow_hyphen_values = true)]
+        names: Vec<String>,
+        /// Set modification time to whole Unix seconds.
+        #[arg(long)]
+        modified_unix_seconds: Option<u64>,
+        /// Encrypt selected payloads using the new password file.
+        #[arg(long, conflicts_with = "decrypt", requires = "new_password_file")]
+        encrypt: bool,
+        /// Remove encryption from selected payloads.
+        #[arg(long, conflicts_with = "encrypt")]
+        decrypt: bool,
+        /// New password source; credentials are never accepted inline.
+        #[arg(long, requires = "encrypt")]
+        new_password_file: Option<PathBuf>,
+        /// Encrypt 7z headers to hide filenames; requires archive-wide encryption.
+        #[arg(long, requires = "encrypt")]
+        encrypt_headers: bool,
+        /// Publish a new archive without overwriting; otherwise replace the admitted source.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
+        /// Verify every retained payload, in addition to required transformed-entry checks.
+        #[arg(long)]
+        verify: bool,
+    },
+    /// Remove exact ZIP archive names; a trailing '/' includes descendants.
+    Delete {
+        archive: PathBuf,
+        #[arg(long = "name", required = true, allow_hyphen_values = true)]
+        names: Vec<String>,
+        /// Write a new artifact without overwriting; otherwise replace the admitted archive.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Print validated decisions without creating any output.
+        #[arg(long)]
+        dry_run: bool,
+        /// Decode and verify every retained payload before publication.
+        #[arg(long)]
+        verify: bool,
+    },
+    /// Rename ZIP entries using simultaneous OLD NEW pairs; directory names end in '/'.
+    Rename {
+        archive: PathBuf,
+        #[arg(long = "pair", num_args = 2, action = clap::ArgAction::Append, required = true, allow_hyphen_values = true)]
+        pairs: Vec<String>,
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        verify: bool,
+    },
     /// Compress a single file using a stream or raw Windows codec.
     Compress {
         /// Codec name; defaults to the output suffix for compression and detection for decompression.
@@ -238,6 +318,9 @@ enum Command {
         window_order: u8,
     },
     Deflate {
+        /// Native DEFLATE effort, from 0 (stored blocks) to 9 (maximum effort).
+        #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u8).range(0..=9))]
+        compression_level: u8,
         #[arg(short = 'f', long, value_enum)]
         format: Option<DeflateWrapper>,
         #[arg(short = 'i', long)]
@@ -299,6 +382,39 @@ enum Command {
 }
 
 impl Cli {
+    fn has_selection(&self) -> bool {
+        !self.include.is_empty()
+            || !self.exclude.is_empty()
+            || self.literal_names
+            || self.ignore_ascii_case
+    }
+
+    fn selection(
+        &self,
+    ) -> Result<archive_core::selection::NameSelection, Box<dyn std::error::Error>> {
+        use archive_core::selection::{
+            CasePolicy, MatchScope, NamePattern, NameSelection, PatternMode, SelectionLimits,
+        };
+        let mode = if self.literal_names {
+            PatternMode::Literal
+        } else {
+            PatternMode::Wildcard
+        };
+        let patterns = |values: &[String]| -> Result<Vec<NamePattern>, archive_core::selection::SelectionError> {
+            values.iter().map(|value| NamePattern::new(value.as_bytes().to_vec(), mode, MatchScope::FullPath, true)).collect()
+        };
+        Ok(NameSelection::new(
+            &patterns(&self.include)?,
+            &patterns(&self.exclude)?,
+            if self.ignore_ascii_case {
+                CasePolicy::AsciiInsensitive
+            } else {
+                CasePolicy::Sensitive
+            },
+            SelectionLimits::default(),
+        )?)
+    }
+
     fn limits(&self) -> Limits {
         let operation = if matches!(
             self.command,
@@ -336,7 +452,53 @@ impl Cli {
 
 fn main() {
     install_interrupt_handler();
-    let args = tar_args::expand(memory::normalize_args(std::env::args_os().collect()));
+    let args: Vec<_> = std::env::args_os().collect();
+    let namespace = if args
+        .get(1)
+        .is_some_and(|arg| arg == "--json" || arg == "-j")
+    {
+        2
+    } else {
+        1
+    };
+    if args.get(namespace).is_some_and(|arg| arg == "7z")
+        && args.len() == namespace + 2
+        && args
+            .get(namespace + 1)
+            .is_some_and(|arg| arg == "--help" || arg == "-h")
+    {
+        let inventory = archive_core::compatibility::inventory();
+        for row in inventory
+            .rows
+            .iter()
+            .filter(|row| row.id == "frontend.read-subset")
+        {
+            println!(
+                "{}\n{}\n{}\n{}",
+                inventory.reference_version, row.grammar, row.effect, row.availability
+            );
+        }
+        return;
+    }
+    let args = match sevenz_args::lower(args) {
+        Ok(args) => args,
+        Err(error) => {
+            let code = match error.kind {
+                sevenz_args::ErrorKind::Argument => 2,
+                sevenz_args::ErrorKind::Unsupported => 3,
+            };
+            if std::env::args_os().any(|arg| arg == "--json" || arg == "-j") {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version":1,"ok":false,"error":{"code":code,"message":error.to_string()}})
+                );
+            } else {
+                eprintln!("arc: {error}");
+            }
+            std::process::exit(code);
+        }
+    };
+    let args = tar_args::expand(memory::normalize_args(args));
     let mut cli = match args.and_then(Cli::try_parse_from) {
         Ok(cli) => cli,
         Err(error) => {
@@ -362,6 +524,12 @@ fn main() {
     if let Err(error) = result {
         let code = if CANCELLED.load(std::sync::atomic::Ordering::Relaxed) {
             130
+        } else if let Some(error) = error.downcast_ref::<archive_core::selection::SelectionError>()
+        {
+            match error {
+                archive_core::selection::SelectionError::LimitExceeded(_) => 5,
+                _ => 2,
+            }
         } else {
             error.downcast_ref::<archive_core::Error>().map_or_else(
                 || {
@@ -431,6 +599,74 @@ fn prepare_output(cli: &mut Cli) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    if cli.has_selection()
+        && !matches!(
+            cli.command,
+            Command::List { .. } | Command::Test { .. } | Command::Extract { .. }
+        )
+    {
+        return Err(archive_core::Error::Unsupported(
+            "name selection requires list, test or extract".into(),
+        )
+        .into());
+    }
+    let selection = cli.selection()?;
+    if matches!(cli.command, Command::Capabilities) {
+        let formats = [
+            Format::Zip,
+            Format::Tar,
+            Format::TarGzip,
+            Format::Cab,
+            Format::SevenZip,
+            Format::Xz,
+            Format::TarXz,
+            Format::Wim,
+            Format::Iso,
+            Format::Udf,
+            Format::Gzip,
+            Format::Zlib,
+            Format::Lzma,
+            Format::Deflate,
+            Format::Bzip2,
+            Format::Brotli,
+            Format::TarBzip2,
+            Format::TarBrotli,
+        ];
+        let result = serde_json::json!({
+            "schema_version": 1,
+            "ok": true,
+            "operation": "capabilities",
+            "formats": formats.into_iter().map(archive_core::capabilities).collect::<Vec<_>>(),
+            "packages": {
+                "formats": ["appx", "msix", "msi", "appxbundle", "msixbundle"],
+                "list": true, "test": true, "extract": true,
+                "create": false, "edit": false, "sign": false,
+            },
+            "editing": {
+                "zip": {
+                    "rename": true, "delete": true, "add": false, "update": false,
+                    "modified_time": true, "entry_encryption": true,
+                    "filename_encryption": false,
+                    "native_publication": cfg!(unix),
+                    "profile": "single-disk, prefix-free, contiguous Copy/DEFLATE/AES/ZipCrypto ZIP; known extras only",
+                    "verification": "transformed payloads authenticated and verified; optional retained-payload verification",
+                },
+                "7z": {
+                    "modified_time": true, "entry_encryption": "complete compression groups",
+                    "filename_encryption": true, "native_publication": cfg!(unix),
+                    "profile": "preserved supported coder graphs; solid subsets rejected",
+                },
+                "other_formats": false,
+            },
+            "compatibility": archive_core::compatibility::inventory(),
+        });
+        if cli.json {
+            println!("{result}");
+        } else {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        return Ok(());
+    }
     let enabled = matches!(cli.progress, Progress::Always)
         || (matches!(cli.progress, Progress::Auto) && !cli.json && io::stderr().is_terminal());
     #[cfg(not(feature = "progress"))]
@@ -446,6 +682,14 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let _ = enabled;
     let limits = cli.limits();
     let result = match &cli.command {
+        Command::Edit { .. } => archive_edit_operations::run(cli, limits)?,
+        Command::Compatibility { .. } => {
+            return Err(archive_core::Error::Unsupported(
+                "7z namespace must follow only an optional --json/-j; use arc 7z --help".into(),
+            )
+            .into());
+        }
+        Command::Delete { .. } | Command::Rename { .. } => zip_operations::run(cli, limits)?,
         Command::Compress { output, .. } | Command::Decompress { output, .. } => {
             let result = single_file::run(cli, limits)?;
             if output == Path::new("-") {
@@ -457,6 +701,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             format,
             input,
             output,
+            ..
         }
         | Command::Inflate {
             format,
@@ -479,6 +724,13 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 "deflate"
             };
+            let compression_options =
+                archive_core::options::DeflateOptions::default().with_level(match cli.command {
+                    Command::Deflate {
+                        compression_level, ..
+                    } => compression_level,
+                    _ => 6,
+                })?;
             let source: Box<dyn io::Read> = if input == Path::new("-") {
                 Box::new(io::stdin())
             } else {
@@ -510,7 +762,13 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 if operation == "inflate" {
                     archive_core::inflate_stream(&mut source, &mut sink, format, limits)
                 } else {
-                    archive_core::deflate_stream(&mut source, &mut sink, format, limits)
+                    archive_core::deflate_stream_with_options(
+                        &mut source,
+                        &mut sink,
+                        format,
+                        limits,
+                        compression_options,
+                    )
                 }
             };
             let mut transform = transform;
@@ -527,7 +785,11 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             check_cancelled()?;
             temp.as_file().sync_all()?;
             temp.persist_noclobber(output)?;
-            serde_json::json!({"schema_version":1,"ok":true,"operation":operation,"bytes":bytes})
+            let mut result = serde_json::json!({"schema_version":1,"ok":true,"operation":operation,"bytes":bytes});
+            if operation == "deflate" {
+                result["effective_settings"] = serde_json::to_value(compression_options)?;
+            }
+            result
         }
         Command::Create {
             compression,
@@ -733,6 +995,12 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 _ => unreachable!(),
             };
             if path == Path::new("-") {
+                if cli.has_selection() {
+                    return Err(archive_core::Error::Unsupported(
+                        "name selection for forward-only stdin".into(),
+                    )
+                    .into());
+                }
                 let result = streams::stdin_operation(cli, limits)?;
                 if cli.json {
                     println!("{result}");
@@ -819,22 +1087,56 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     result => result?,
                 }
             };
+            let selected: Vec<_> = archive
+                .entries()
+                .iter()
+                .filter_map(|entry| {
+                    match if cli.has_selection() {
+                        selection.matches(if archive.format() == Format::SevenZip {
+                            entry.name.as_bytes()
+                        } else {
+                            &entry.raw_name
+                        })
+                    } else {
+                        Ok(true)
+                    } {
+                        Ok(true) => Some(Ok(entry.clone())),
+                        Ok(false) => None,
+                        Err(error) => Some(Err(error)),
+                    }
+                })
+                .collect::<Result<_, _>>()?;
             if cli.verbose && !matches!(command, Command::List { .. }) {
-                for entry in archive.entries() {
+                for entry in &selected {
                     eprintln!("{}", entry.name);
                 }
             }
             match command {
                 Command::List { .. } => {
-                    let entries: Vec<_> = archive.entries().iter().map(|e| serde_json::json!({"id":e.id.0,"name":e.name,"raw_name":e.raw_name,"kind":format!("{:?}",e.kind).to_lowercase(),"size":e.size,"compressed_size":e.compressed_size,"compression":e.compression,"encrypted":e.encrypted})).collect();
+                    let entries: Vec<_> = selected.iter().map(|e| serde_json::json!({"id":e.id.0,"name":e.name,"raw_name":e.raw_name,"kind":format!("{:?}",e.kind).to_lowercase(),"size":e.size,"compressed_size":e.compressed_size,"compression":e.compression,"encrypted":e.encrypted})).collect();
                     if !cli.json {
-                        for e in archive.entries() {
+                        for e in &selected {
                             println!("{:>12} {}", e.size, e.name);
                         }
                     }
                     serde_json::json!({"schema_version":1,"ok":true,"operation":"list","format":format!("{:?}",archive.format()).to_lowercase(),"entries":entries})
                 }
                 Command::Test { .. } => {
+                    if cli.has_selection() {
+                        let ids: Vec<_> = selected.iter().map(|entry| entry.id).collect();
+                        let report = archive.extract_selected_cancellable(
+                            &ids,
+                            || CANCELLED.load(std::sync::atomic::Ordering::Relaxed),
+                            &mut |_, _| Ok(()),
+                        )?;
+                        let result = serde_json::json!({"schema_version":1,"ok":true,"operation":"test","scope":"selected-entries","verified":report.verified,"bytes":report.bytes,"entries":report.entries});
+                        if cli.json {
+                            println!("{result}");
+                        } else {
+                            println!("test");
+                        }
+                        return Ok(());
+                    }
                     #[cfg(feature = "progress")]
                     let report = if let Some(renderer) = &mut bar {
                         archive.test_observed_cancellable(&mut renderer.observer, || {
@@ -859,7 +1161,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     std::fs::create_dir_all(output)?;
                     let mut destination = archive_fs::Destination::open(output)?;
-                    let mut selected = archive.entries().to_vec();
+                    let mut selected = selected;
                     if matches!(archive.format(), Format::Iso | Format::SevenZip) {
                         for entry in &mut selected {
                             entry.raw_name = entry.name.as_bytes().to_vec();
@@ -1212,6 +1514,20 @@ fn package_operation(
     cli: &Cli,
     path: &Path,
 ) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+    let explicit_optical = match &cli.command {
+        Command::List { format, .. }
+        | Command::Test { format, .. }
+        | Command::Extract { format, .. } => format
+            .as_deref()
+            .and_then(|name| name.parse::<Format>().ok())
+            .is_some_and(|format| matches!(format, Format::Iso | Format::Udf)),
+        _ => false,
+    };
+    if cli.has_selection() && (cli.view.is_some() || explicit_optical) {
+        return Err(
+            archive_core::Error::Unsupported("name selection for optical adapters".into()).into(),
+        );
+    }
     let mut extension = path
         .extension()
         .and_then(|v| v.to_str())
@@ -1254,6 +1570,26 @@ fn package_operation(
         extension = "msi".into();
     } else if matches!(extension.as_str(), "wim" | "esd" | "msi") {
         extension.clear();
+    }
+    if cli.has_selection()
+        && (cli.view.is_some()
+            || matches!(
+                extension.as_str(),
+                "wim"
+                    | "esd"
+                    | "msi"
+                    | "appx"
+                    | "msix"
+                    | "appxbundle"
+                    | "msixbundle"
+                    | "iso"
+                    | "udf"
+            ))
+    {
+        return Err(archive_core::Error::Unsupported(
+            "name selection for package, WIM and optical adapters".into(),
+        )
+        .into());
     }
     if !cli.media.is_empty() && extension != "msi" {
         return Err(

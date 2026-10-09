@@ -593,6 +593,16 @@ pub(crate) fn create_readers<'a, E: crate::CreationEntry>(
     container::write_readers(entries, open, output, options, limits)
 }
 
+pub(crate) fn edit_archive<R: Read + Seek, W: Write + Seek>(
+    source: &mut R,
+    output: &mut W,
+    operations: &[crate::sevenz_edit::EditOperation],
+    options: crate::sevenz_edit::EditOptions<'_>,
+    limits: Limits,
+) -> Result<crate::sevenz_edit::EditReport> {
+    container::edit_archive(source, output, operations, options, limits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

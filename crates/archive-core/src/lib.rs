@@ -4,15 +4,19 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(feature = "cab")]
 mod cab_backend;
+/// Source-linked native and planned 7-Zip option compatibility inventory.
+pub mod compatibility;
 #[cfg(any(feature = "xz", feature = "gzip", feature = "streams"))]
 mod compressed;
 mod format;
 mod memory;
+pub mod options;
 pub use memory::{MemoryOperation, MemoryUsage};
 pub mod incremental;
 pub mod progress;
 #[path = "io.rs"]
 pub mod range;
+pub mod selection;
 #[cfg(feature = "tar")]
 pub mod sequential_tar;
 #[cfg(feature = "sevenz")]
@@ -21,6 +25,7 @@ mod sevenz_backend;
 pub mod single_stream;
 #[cfg(feature = "udf")]
 pub mod udf;
+pub mod update;
 #[cfg(feature = "wim")]
 pub mod wim;
 #[cfg(feature = "xz")]
@@ -93,10 +98,16 @@ pub enum ZipEncryption {
     Aes256,
     ZipCrypto,
 }
+/// Bounded 7z timestamp and payload/header encryption editing.
+#[cfg(feature = "sevenz")]
+pub mod sevenz_edit;
 #[cfg(feature = "tar")]
 mod tar_backend;
 #[cfg(feature = "zip")]
 mod zip_backend;
+/// Bounded ZIP metadata and encryption editing.
+#[cfg(feature = "zip")]
+pub mod zip_edit;
 
 pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, thiserror::Error)]
@@ -1048,6 +1059,24 @@ pub fn deflate_stream(
     format: Format,
     limits: Limits,
 ) -> Result<u64> {
+    deflate_stream_with_options(
+        reader,
+        writer,
+        format,
+        limits,
+        options::DeflateOptions::default(),
+    )
+}
+/// Compress forward-only input with validated native DEFLATE effort settings.
+/// Unsupported wrappers and inadequate codec budgets fail before writing.
+#[cfg(feature = "streams")]
+pub fn deflate_stream_with_options(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    format: Format,
+    limits: Limits,
+    options: options::DeflateOptions,
+) -> Result<u64> {
     let window = match format {
         Format::Deflate => -15,
         Format::Zlib => 15,
@@ -1057,7 +1086,7 @@ pub fn deflate_stream(
     if limits.max_dictionary_bytes < 32768 || limits.max_active_workspace_bytes < 1 << 20 {
         return Err(Error::ResourceLimit("DEFLATE workspace"));
     }
-    let mut compressor = codec::DeflateWriter::new(writer, window);
+    let mut compressor = codec::DeflateWriter::with_level(writer, window, options.level());
     let maximum = limits.max_input_bytes.min(limits.max_total_bytes);
     let bytes = copy_bounded(reader, &mut compressor, maximum)?;
     compressor.finish()?;

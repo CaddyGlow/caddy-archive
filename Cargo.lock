@@ -174,10 +174,10 @@ dependencies = [
 
 [[package]]
 name = "caddy-archive-cli"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "caddy-archive-core 0.2.1",
- "caddy-archive-core 0.3.2",
+ "caddy-archive-core 0.3.3",
  "caddy-archive-fs",
  "clap",
  "indicatif",
@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-archive-core"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "aes",
  "brotli",
@@ -234,19 +234,19 @@ dependencies = [
 
 [[package]]
 name = "caddy-archive-fs"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
- "caddy-archive-core 0.3.2",
+ "caddy-archive-core 0.3.3",
  "libc",
  "tempfile",
 ]
 
 [[package]]
 name = "caddy-archive-wasm"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "caddy-archive-core 0.2.1",
- "caddy-archive-core 0.3.2",
+ "caddy-archive-core 0.3.3",
  "ms-package",
  "serde",
  "serde_json",

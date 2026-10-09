@@ -179,7 +179,9 @@ fn editing_unknown_profiles_and_grammar_fail_before_output() {
     }
 }
 
-#[cfg(unix)]
+// Linux filesystems support arbitrary non-NUL filename bytes; macOS rejects this
+// fixture with EILSEQ. Parser-only coverage remains enabled on every Unix target.
+#[cfg(target_os = "linux")]
 #[test]
 fn non_utf8_dash_archive_paths_survive_switch_termination() {
     use std::os::unix::ffi::OsStringExt;

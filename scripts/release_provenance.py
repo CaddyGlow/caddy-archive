@@ -46,9 +46,16 @@ def validate_locks(root, record=None):
             local = [entry for entry in matching if not entry.get('source')]
             if local and name != 'caddy-archive-core':
                 raise ValueError(f'{relative}: non-registry {name} override')
-            if len(registry) != 1:
+            if len(registry) != 1 and name != 'ms-compress':
                 raise ValueError(f'{relative}: expected one qualified registry {name}')
-            entry = registry[0]
+            # The retained package-core bridge uses ms-compress 0.1, while
+            # current archive readers use 0.2. Qualify the bridge's exact copy.
+            qualified = [entry for entry in registry if entry['version'] == expected['version']]
+            if len(qualified) != 1:
+                raise ValueError(f'{relative}: {name} differs from qualified registry version/checksum/source')
+            if any(entry['source'] != record['registry_source'] for entry in registry):
+                raise ValueError(f'{relative}: non-registry {name} override')
+            entry = qualified[0]
             if any(entry.get(key) != value for key, value in (
                 ('version', expected['version']), ('checksum', expected['checksum']),
                 ('source', record['registry_source']),

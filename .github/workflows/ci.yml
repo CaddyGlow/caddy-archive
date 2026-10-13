@@ -15,6 +15,19 @@ defaults:
   run:
     working-directory: archive-rs
 jobs:
+  core-msrv:
+    name: Core and filesystem on Rust 1.96
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: archive-rs
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: clippy
+      - run: cargo test -p caddy-archive-core -p caddy-archive-fs --all-features --locked
+      - run: cargo clippy -p caddy-archive-core -p caddy-archive-fs --all-targets --all-features --locked -- -D warnings
+
   test:
     runs-on: ubuntu-latest
     steps:

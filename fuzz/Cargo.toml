@@ -10,10 +10,10 @@ publish = false
 [dependencies]
 package-core = { package = "caddy-archive-core", version = "=0.2.1", default-features = false }
 honggfuzz = "0.5"
-cabinet = { version = "0.1.0", package = "ms-cabinet" }
-archive-core = { version = "0.3.3", package = "caddy-archive-core", path = "../crates/archive-core", features = ["sevenz", "crypto", "wim", "udf", "bzip2", "brotli"] }
+cabinet = { version = "0.1.5", package = "ms-cabinet" }
+archive-core = { version = "0.3.4", package = "caddy-archive-core", path = "../crates/archive-core", features = ["sevenz", "crypto", "wim", "udf", "bzip2", "brotli"] }
 ms-package = { version = "0.2.2" }
-libmkiso = { version = "0.1.0", default-features = false, features = ["native-writer"] }
+libmkiso = { version = "0.1.5", default-features = false, features = ["native-writer"] }
 tempfile = "3"
 sha2 = "0.10"
 

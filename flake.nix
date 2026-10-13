@@ -28,39 +28,45 @@
         system:
         let
           pkgs = pkgsFor system;
-          rust = pkgs.rust-bin.stable."1.99.0".default.override {
-            extensions = [ "rust-src" ];
-            targets = [
-              "wasm32-unknown-unknown"
-              "x86_64-pc-windows-msvc"
-              "i686-pc-windows-msvc"
-            ];
-          };
+          mkRustShell =
+            version:
+            let
+              rust = pkgs.rust-bin.stable.${version}.default.override {
+                extensions = [ "rust-src" ];
+                targets = [
+                  "wasm32-unknown-unknown"
+                  "x86_64-pc-windows-msvc"
+                  "i686-pc-windows-msvc"
+                ];
+              };
+            in
+            pkgs.mkShell {
+              packages = [
+                rust
+                pkgs.go-task
+                pkgs.python3
+                pkgs.sccache
+                pkgs.nixfmt
+                pkgs.cargo-xwin
+                pkgs.clang
+                pkgs.lld
+                pkgs.llvm
+                pkgs.actionlint
+                pkgs.powershell
+                pkgs.shellcheck
+                # Native dependencies for honggfuzz's instrumented builds.
+                pkgs.gnumake
+                pkgs.binutils-unwrapped
+                pkgs.libunwind
+                pkgs.xz
+              ];
+              XWIN_ARCH = "x86,x86_64";
+              shellHook = "";
+            };
         in
         {
-          default = pkgs.mkShell {
-            packages = [
-              rust
-              pkgs.go-task
-              pkgs.python3
-              pkgs.sccache
-              pkgs.nixfmt
-              pkgs.cargo-xwin
-              pkgs.clang
-              pkgs.lld
-              pkgs.llvm
-              pkgs.actionlint
-              pkgs.powershell
-              pkgs.shellcheck
-              # Native dependencies for honggfuzz's instrumented builds.
-              pkgs.gnumake
-              pkgs.binutils-unwrapped
-              pkgs.libunwind
-              pkgs.xz
-            ];
-            XWIN_ARCH = "x86,x86_64";
-            shellHook = "";
-          };
+          default = mkRustShell "1.99.0";
+          msrv = mkRustShell "1.96.0";
         }
       );
     };

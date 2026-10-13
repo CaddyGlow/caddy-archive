@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "qualification": "ms-package MSI media refactoring, 2026-10-09",
+  "qualification": "Retained ms-package MSI media qualification with Rust 1.96 cabinet dependency update, 2026-10-13",
   "registry_source": "registry+https://github.com/rust-lang/crates.io-index",
   "packages": {
     "ms-package": {
@@ -18,9 +18,9 @@
       "path_in_vcs": ""
     },
     "ms-cabinet": {
-      "version": "0.1.4",
-      "checksum": "ffd95ea08ac6201649b59d5bc138543e2a81477cafc74eb7ddf7db3c52b2c76c",
-      "git_commit": "6eaa28d396810bfe8183ad2f6c79b519daee88b3",
+      "version": "0.1.5",
+      "checksum": "0161501d1ba9955ad2f01c2cfc62fe06744b3a44eac29b0f48312941968f49d0",
+      "git_commit": "db989bf47d8ef6128f97343be21c33fa37393511",
       "repository": "https://github.com/CaddyGlow/ms-cabinet",
       "path_in_vcs": ""
     },

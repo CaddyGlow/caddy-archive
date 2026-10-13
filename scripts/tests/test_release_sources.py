@@ -61,6 +61,19 @@ class ReleaseSourcesTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'immutable'):
             provenance.load(self.root)
 
+    def test_compression_bridge_can_coexist_with_current_registry_version(self):
+        lock = self.root / 'Cargo.lock'
+        original = lock.read_text()
+        extra = ('\n[[package]]\nname = "ms-compress"\nversion = "0.2.1"\n'
+                 f'source = "{provenance.load(self.root)["registry_source"]}"\n'
+                 f'checksum = "{"0" * 64}"\n')
+        lock.write_text(original + extra)
+        provenance.validate_locks(self.root)
+        lock.write_text(original + extra.replace('registry+https://github.com/rust-lang/crates.io-index',
+                                                 'git+https://example.invalid/ms-compress'))
+        with self.assertRaisesRegex(ValueError, 'non-registry'):
+            provenance.validate_locks(self.root)
+
     def test_identical_clean_sources_produce_identical_archives_and_manifest(self):
         first, second = self.parent / 'first.tar.gz', self.parent / 'second.tar.gz'
         self.assertEqual(source_release.create(self.root, first), source_release.create(self.root, second))
